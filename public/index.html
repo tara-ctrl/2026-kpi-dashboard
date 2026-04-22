@@ -187,10 +187,7 @@ async function loadDashboard() {
       errorArea.innerHTML = '<div class="error-banner">&#9888; Some data sources had errors: ' + data.errors.join('; ') + '</div>';
     }
 
-    // Show Stripe timing diagnostics if available
-    if (data.stripe && data.stripe.timings) {
-      errorArea.innerHTML += '<div class="note-banner">Stripe timing: ' + data.stripe.timings.join(' | ') + '</div>';
-    }
+    // Stripe timing diagnostics available in data.stripe.timings (hidden from UI)
 
     const stripeWeeks = (data.stripe && data.stripe.weeks) || [];
     const hubspotWeeks = (data.hubspot && data.hubspot.weeks) || [];
@@ -253,6 +250,12 @@ async function loadDashboard() {
     const monthlyRevenue = (data.stripe && data.stripe.monthlyRevenue) || 0;
     const newRevenueThisMonth = (data.stripe && data.stripe.newRevenueThisMonth) || 0;
     const newRevenuePriorMonth = (data.stripe && data.stripe.newRevenuePriorMonth) || 0;
+    const priorMonthMRR = (data.stripe && data.stripe.priorMonthMRR) || 0;
+    const cancelTotal = (data.stripe && data.stripe.cancelTotal) || 0;
+    const cancelVoluntary = (data.stripe && data.stripe.cancelVoluntary) || 0;
+    const cancelFailedPayment = (data.stripe && data.stripe.cancelFailedPayment) || 0;
+    const cancelOther = (data.stripe && data.stripe.cancelOther) || 0;
+    const cancelMRRLost = (data.stripe && data.stripe.cancelMRRLost) || 0;
     const stripeImplFeeCount = (data.stripe && data.stripe.implFeeCount) || 0;
     const stripeImplFeeRevenue = (data.stripe && data.stripe.implFeeRevenue) || 0;
 
@@ -277,12 +280,13 @@ async function loadDashboard() {
     // ============================================================
 
     const kpis = [
-      { label: "Current MRR", value: "$" + currentMRR.toLocaleString(), sub: { pct: "$" + subscriptionMRR.toLocaleString() + " subs + $" + implFeesMRR.toLocaleString() + " impl fees", dir: "neutral" }, source: "Stripe" },
+      { label: "Current MRR", value: "$" + currentMRR.toLocaleString(), sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
       { label: "Current ARR", value: "$" + currentARR.toLocaleString(), sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
       { label: "Active Subscriptions", value: totalActiveSubs, sub: { pct: monthlySubs + " monthly / " + annualSubs + " annual", dir: "neutral" }, source: "Stripe" },
       { label: "New Revenue This Month", value: "$" + newRevenueThisMonth.toLocaleString(), sub: { pct: "From new subscriptions started this month", dir: "neutral" }, source: "Stripe" },
-      { label: "MoM Gross Growth", value: (function() { if (newRevenuePriorMonth === 0) return "N/A"; var pct = ((newRevenueThisMonth - newRevenuePriorMonth) / newRevenuePriorMonth * 100).toFixed(1); return (pct > 0 ? "+" : "") + pct + "%"; })(), sub: { pct: "$" + newRevenuePriorMonth.toLocaleString() + " new rev last month", dir: newRevenuePriorMonth === 0 ? "neutral" : (newRevenueThisMonth >= newRevenuePriorMonth ? "up" : "down") }, source: "Stripe" },
+      { label: "MoM Gross Growth", value: (function() { if (priorMonthMRR === 0) return "N/A"; var pct = ((currentMRR - priorMonthMRR) / priorMonthMRR * 100).toFixed(1); return (pct > 0 ? "+" : "") + pct + "%"; })(), sub: { pct: "Prior month MRR: $" + priorMonthMRR.toLocaleString(), dir: priorMonthMRR === 0 ? "neutral" : (currentMRR >= priorMonthMRR ? "up" : "down") }, source: "Stripe" },
       { label: "Impl. Fees (YTD)", value: "$" + stripeImplFeeRevenue.toLocaleString(), sub: { pct: stripeImplFeeCount + " fees collected", dir: "neutral" }, source: "Stripe" },
+      { label: "Cancellations (This Month)", value: cancelTotal, sub: { pct: cancelVoluntary + " voluntary / " + cancelFailedPayment + " failed payment" + (cancelOther > 0 ? " / " + cancelOther + " other" : "") + " · -$" + cancelMRRLost.toLocaleString() + " MRR", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
       { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
       { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: wowChange(newEstates), source: "Supabase" },
