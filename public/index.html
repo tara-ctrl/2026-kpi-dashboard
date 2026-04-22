@@ -1,499 +1,402 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Trustate KPI Dashboard — 2026 YTD</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-  :root {
-    --bg: #0f1117;
-    --card: #1a1d27;
-    --border: #2a2d3a;
-    --text: #e4e4e7;
-    --muted: #9ca3af;
-    --accent: #6366f1;
-    --green: #22c55e;
-    --red: #ef4444;
-    --amber: #f59e0b;
-    --blue: #3b82f6;
-    --purple: #a855f7;
-    --cyan: #06b6d4;
-    --pink: #ec4899;
+// /api/stripe — Unified endpoint: fetches from Stripe, HubSpot, AND Supabase
+// Uses native fetch — no npm packages required
+// Returns combined data from all three sources in one response
+
+const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
+
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  const now = new Date();
+  const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+  const weeks = getWeekBuckets(yearStart);
+
+  // Run all three fetches in parallel
+  const [stripeResult, hubspotResult, supabaseResult] = await Promise.allSettled([
+    fetchStripe(weeks, yearStart, now),
+    fetchHubSpot(weeks, yearStart),
+    fetchSupabase(weeks, yearStart)
+  ]);
+
+  const response = {};
+  const errors = [];
+
+  // Stripe
+  if (stripeResult.status === 'fulfilled') {
+    response.stripe = stripeResult.value;
+  } else {
+    errors.push('Stripe: ' + stripeResult.reason.message);
+    response.stripe = { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
-  * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
 
-  .header { padding: 24px 32px 16px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border); }
-  .header h1 { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
-  .header h1 span { color: var(--accent); }
-  .header-right { display: flex; align-items: center; gap: 16px; }
-  .badge { background: #22c55e22; color: var(--green); font-size: 12px; padding: 4px 10px; border-radius: 999px; font-weight: 600; }
-  .badge.loading { background: #f59e0b22; color: var(--amber); }
-  .badge.error { background: #ef444422; color: var(--red); }
-  .date-label { color: var(--muted); font-size: 13px; }
+  // HubSpot
+  if (hubspotResult.status === 'fulfilled') {
+    response.hubspot = hubspotResult.value;
+  } else {
+    errors.push('HubSpot: ' + hubspotResult.reason.message);
+    response.hubspot = { weeks: weeks.map(w => ({ weekOf: w.label })) };
+  }
 
-  .kpi-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; padding: 24px 32px; }
-  .kpi-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px; }
-  .kpi-label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
-  .kpi-value { font-size: 28px; font-weight: 700; letter-spacing: -1px; }
-  .kpi-sub { font-size: 12px; color: var(--muted); margin-top: 4px; display: flex; align-items: center; gap: 4px; }
-  .kpi-sub .up { color: var(--green); }
-  .kpi-sub .down { color: var(--red); }
-  .kpi-sub .neutral { color: var(--amber); }
+  // Supabase
+  if (supabaseResult.status === 'fulfilled') {
+    response.supabase = supabaseResult.value;
+  } else {
+    errors.push('Supabase: ' + supabaseResult.reason.message);
+    response.supabase = { weeks: weeks.map(w => ({ weekOf: w.label })) };
+  }
 
-  .charts-section { padding: 0 32px 32px; }
-  .chart-row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
-  .chart-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; }
-  .chart-card.full { grid-column: 1 / -1; }
-  .chart-title { font-size: 14px; font-weight: 600; margin-bottom: 16px; display: flex; align-items: center; gap: 8px; }
-  .chart-title .dot { width: 8px; height: 8px; border-radius: 50%; }
-  .chart-container { position: relative; height: 260px; }
+  if (errors.length > 0) response.errors = errors;
 
-  .data-table-wrap { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 20px 24px; margin: 0 32px 32px; overflow-x: auto; }
-  .data-table-wrap h3 { font-size: 14px; font-weight: 600; margin-bottom: 16px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th { text-align: left; color: var(--muted); font-weight: 500; padding: 8px 12px; border-bottom: 1px solid var(--border); text-transform: uppercase; font-size: 11px; letter-spacing: 0.5px; }
-  td { padding: 10px 12px; border-bottom: 1px solid var(--border); }
-  tr:last-child td { border-bottom: none; }
-  tr:hover td { background: #ffffff06; }
-  .pill { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
-  .pill.green { background: #22c55e18; color: var(--green); }
-  .pill.red { background: #ef444418; color: var(--red); }
-  .pill.amber { background: #f59e0b18; color: var(--amber); }
-  .pill.blue { background: #3b82f618; color: var(--blue); }
+  res.status(200).json(response);
+};
 
-  .note-banner { margin: 0 32px 16px; padding: 12px 16px; background: #f59e0b12; border: 1px solid #f59e0b33; border-radius: 10px; font-size: 13px; color: var(--amber); }
-  .error-banner { margin: 0 32px 16px; padding: 12px 16px; background: #ef444412; border: 1px solid #ef444433; border-radius: 10px; font-size: 13px; color: var(--red); }
-  .loading-card { grid-column: 1 / -1; text-align: center; padding: 40px; }
-
-  @media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3, 1fr); } .chart-row { grid-template-columns: 1fr; } }
-  @media (max-width: 700px) { .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
-</style>
-</head>
-<body>
-
-<div class="header">
-  <h1><span>Trustate</span> KPI Dashboard</h1>
-  <div class="header-right">
-    <span class="badge loading" id="statusBadge">LOADING...</span>
-    <span class="date-label" id="dateLabel">2026 Year-to-Date</span>
-  </div>
-</div>
-
-<!-- Note about Webflow -->
-<div class="note-banner">
-  &#9888; Website visitor data (trustate.com) is not available through the Webflow API. Connect Google Analytics for live visitor tracking.
-</div>
-
-<!-- Error messages -->
-<div id="errorArea"></div>
-
-<!-- KPI Summary Cards -->
-<div class="kpi-grid" id="kpiCards">
-  <div class="kpi-card loading-card">
-    <div class="kpi-label">Loading live data from Stripe, HubSpot &amp; Supabase...</div>
-  </div>
-</div>
-
-<!-- Charts -->
-<div class="charts-section">
-  <div class="chart-row">
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--blue)"></span> Demos &amp; Info Sessions per Week</div>
-      <div class="chart-container"><canvas id="chartDemos"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--green)"></span> New Subscriptions per Week</div>
-      <div class="chart-container"><canvas id="chartSubs"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--purple)"></span> Subscription Changes — Stripe (Upgrades / Downgrades / Cancellations)</div>
-      <div class="chart-container"><canvas id="chartChurn"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--cyan)"></span> Searches &amp; New Estates per Week</div>
-      <div class="chart-container"><canvas id="chartProduct"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--accent)"></span> Demo-to-Sale Conversion Rate (Weekly)</div>
-      <div class="chart-container"><canvas id="chartConversion"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--pink)"></span> Weekly MRR Impact by Event Type (Stripe, includes Impl. Fees)</div>
-      <div class="chart-container"><canvas id="chartPlanBreakdown"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-card full">
-      <div class="chart-title"><span class="dot" style="background:var(--amber)"></span> Implementation Fee Revenue per Week — Included in MRR (Stripe)</div>
-      <div class="chart-container"><canvas id="chartImplFee"></canvas></div>
-    </div>
-  </div>
-</div>
-
-<!-- Weekly Detail Table -->
-<div class="data-table-wrap">
-  <h3>Weekly Breakdown — All Metrics</h3>
-  <table id="weeklyTable">
-    <thead>
-      <tr>
-        <th>Week</th>
-        <th>Demos</th>
-        <th>New Subs</th>
-        <th>Conversion</th>
-        <th>Upgrades</th>
-        <th>Downgrades</th>
-        <th>Reactivations</th>
-        <th>Cancellations</th>
-        <th>Impl. Fees</th>
-        <th>Impl. Revenue</th>
-        <th>Searches</th>
-        <th>New Estates</th>
-      </tr>
-    </thead>
-    <tbody></tbody>
-  </table>
-</div>
-
-<script>
 // ============================================================
-// LIVE DATA LOADER
+// STRIPE
 // ============================================================
+async function fetchStripe(weeks, yearStart, now) {
+  const SK = process.env.STRIPE_SECRET_KEY;
+  if (!SK) throw new Error('STRIPE_SECRET_KEY not configured');
 
-Chart.defaults.color = "#9ca3af";
-Chart.defaults.borderColor = "#2a2d3a";
-Chart.defaults.font.family = "'Inter', sans-serif";
-Chart.defaults.font.size = 12;
-const gridOpts = { color: "#2a2d3a22" };
+  const headers = { 'Authorization': 'Bearer ' + SK };
+  const yearStartUnix = Math.floor(yearStart.getTime() / 1000);
 
-async function loadDashboard() {
-  const errorArea = document.getElementById('errorArea');
-  const statusBadge = document.getElementById('statusBadge');
-  const dateLabel = document.getElementById('dateLabel');
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, newMRR: 0, churn: 0, upgrade: 0, downgrade: 0,
+    reactivation: 0, implFeeCount: 0, implFeeRevenue: 0,
+    cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
+  }));
 
-  try {
-    // Fetch all three data sources in parallel
-    const [stripeRes, hubspotRes, supabaseRes] = await Promise.allSettled([
-      fetch('/api/stripe').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
-      fetch('/api/hubspot').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); }),
-      fetch('/api/supabase').then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-    ]);
+  // 1. Active subscriptions for current MRR
+  let currentMRR = 0;
+  let hasMore = true;
+  let startingAfter = '';
 
-    // Check for errors
-    const errors = [];
-    if (stripeRes.status === 'rejected') errors.push('Stripe: ' + stripeRes.reason.message);
-    if (hubspotRes.status === 'rejected') errors.push('HubSpot: ' + hubspotRes.reason.message);
-    if (supabaseRes.status === 'rejected') errors.push('Supabase: ' + supabaseRes.reason.message);
+  while (hasMore) {
+    const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
 
-    const stripe = stripeRes.status === 'fulfilled' ? stripeRes.value : null;
-    const hubspot = hubspotRes.status === 'fulfilled' ? hubspotRes.value : null;
-    const supabase = supabaseRes.status === 'fulfilled' ? supabaseRes.value : null;
-
-    if (stripe && stripe.error) errors.push('Stripe: ' + stripe.error);
-    if (hubspot && hubspot.error) errors.push('HubSpot: ' + hubspot.error);
-    if (supabase && supabase.error) errors.push('Supabase: ' + supabase.error);
-
-    if (errors.length > 0) {
-      errorArea.innerHTML = '<div class="error-banner">&#9888; Some data sources had errors: ' + errors.join('; ') + '</div>';
+    for (const sub of data.data) {
+      currentMRR += calcMRR(sub);
     }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+  }
 
-    // Use the longest week array as canonical
-    const stripeWeeks = (stripe && stripe.weeks) || [];
-    const hubspotWeeks = (hubspot && hubspot.weeks) || [];
-    const supabaseWeeks = (supabase && supabase.weeks) || [];
+  // 2. Subscription events
+  const eventTypes = [
+    'customer.subscription.created',
+    'customer.subscription.deleted',
+    'customer.subscription.updated'
+  ];
 
-    const numWeeks = Math.max(stripeWeeks.length, hubspotWeeks.length, supabaseWeeks.length);
-    if (numWeeks === 0) throw new Error('No weekly data returned from any source');
+  for (const eventType of eventTypes) {
+    hasMore = true;
+    startingAfter = '';
+    while (hasMore) {
+      const url = 'https://api.stripe.com/v1/events?type=' + eventType +
+        '&created[gte]=' + yearStartUnix + '&limit=100' +
+        (startingAfter ? '&starting_after=' + startingAfter : '');
+      const resp = await fetch(url, { headers });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
 
-    // Build label array from whichever source has data
-    const sourceWeeks = stripeWeeks.length > 0 ? stripeWeeks : (hubspotWeeks.length > 0 ? hubspotWeeks : supabaseWeeks);
-    const weekLabels = sourceWeeks.map(w => w.weekOf);
+      for (const event of data.data) {
+        const createdAt = new Date(event.created * 1000);
+        const wi = findWeekIndex(weeks, createdAt);
+        if (wi === -1) continue;
+        const sub = event.data.object;
 
-    // Helper to get week data by index with fallback
-    function sw(i) { return stripeWeeks[i] || {}; }
-    function hw(i) { return hubspotWeeks[i] || {}; }
-    function sbw(i) { return supabaseWeeks[i] || {}; }
-
-    // Build data arrays
-    const totalDemos = [], infoSessions = [], demosSpecific = [];
-    const newSubs = [], cancellations = [], upgrades = [], downgrades = [], reactivations = [];
-    const searches = [], newEstates = [];
-    const implFeeCount = [], implFeeRevenue = [];
-    const mrrNew = [], mrrChurn = [], mrrUpgrade = [], mrrDowngrade = [], mrrReactivation = [], mrrImplFee = [];
-
-    for (let i = 0; i < numWeeks; i++) {
-      // HubSpot
-      totalDemos.push(hw(i).totalDemos || 0);
-      infoSessions.push(hw(i).infoSessions || 0);
-      demosSpecific.push(hw(i).demosSpecific || 0);
-
-      // Stripe counts
-      newSubs.push(sw(i).newSubs || 0);
-      cancellations.push(sw(i).cancellations || 0);
-      upgrades.push(sw(i).upgrades || 0);
-      downgrades.push(sw(i).downgrades || 0);
-      reactivations.push(sw(i).reactivations || 0);
-      implFeeCount.push(sw(i).implFeeCount || 0);
-      implFeeRevenue.push(sw(i).implFeeRevenue || 0);
-
-      // Stripe MRR amounts
-      mrrNew.push(sw(i).newMRR || 0);
-      mrrChurn.push(sw(i).churn || 0);
-      mrrUpgrade.push(sw(i).upgrade || 0);
-      mrrDowngrade.push(sw(i).downgrade || 0);
-      mrrReactivation.push(sw(i).reactivation || 0);
-      mrrImplFee.push(sw(i).implFeeRevenue || 0);
-
-      // Supabase
-      searches.push(sbw(i).searches || 0);
-      newEstates.push(sbw(i).newEstates || 0);
-    }
-
-    // ============================================================
-    // COMPUTED METRICS
-    // ============================================================
-
-    const currentMRR = (stripe && stripe.currentMRR) || 0;
-    const currentARR = (stripe && stripe.currentARR) || 0;
-
-    const totalDemosYTD = totalDemos.reduce((a,b) => a+b, 0);
-    const totalSubsYTD = newSubs.reduce((a,b) => a+b, 0);
-    const totalCancelsYTD = cancellations.reduce((a,b) => a+b, 0);
-    const totalSearchesYTD = searches.reduce((a,b) => a+b, 0);
-    const totalEstatesYTD = newEstates.reduce((a,b) => a+b, 0);
-    const totalUpgradesYTD = upgrades.reduce((a,b) => a+b, 0);
-    const totalDowngradesYTD = downgrades.reduce((a,b) => a+b, 0);
-    const totalReactivationsYTD = reactivations.reduce((a,b) => a+b, 0);
-    const totalImplFeeYTD = implFeeRevenue.reduce((a,b) => a+b, 0);
-
-    const conversionRate = totalDemos.map((d, i) => d > 0 ? Math.round((newSubs[i] / d) * 100) : 0);
-
-    const lastIdx = numWeeks - 1;
-    const prevIdx = lastIdx - 1;
-    function wowChange(arr) {
-      if (prevIdx < 0 || arr[prevIdx] === 0) return { pct: "N/A", dir: "neutral" };
-      const pct = (((arr[lastIdx] - arr[prevIdx]) / arr[prevIdx]) * 100).toFixed(0);
-      return { pct: (pct > 0 ? "+" : "") + pct + "%", dir: pct > 0 ? "up" : pct < 0 ? "down" : "neutral" };
-    }
-
-    // ============================================================
-    // KPI CARDS
-    // ============================================================
-
-    const kpis = [
-      { label: "Current MRR", value: "$" + currentMRR.toLocaleString(), sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
-      { label: "Current ARR", value: "$" + Math.round(currentARR/1000).toLocaleString() + "k", sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
-      { label: "New Subs (YTD)", value: totalSubsYTD, sub: wowChange(newSubs), source: "Stripe" },
-      { label: "Cancellations (YTD)", value: totalCancelsYTD, sub: wowChange(cancellations), source: "Stripe" },
-      { label: "Upgrades (YTD)", value: totalUpgradesYTD, sub: wowChange(upgrades), source: "Stripe" },
-      { label: "Downgrades (YTD)", value: totalDowngradesYTD, sub: wowChange(downgrades), source: "Stripe" },
-      { label: "Reactivations (YTD)", value: totalReactivationsYTD, sub: wowChange(reactivations), source: "Stripe" },
-      { label: "Impl. Fee Revenue (YTD)", value: "$" + totalImplFeeYTD.toLocaleString(), sub: wowChange(implFeeRevenue), source: "Stripe" },
-      { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
-      { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
-      { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: wowChange(newEstates), source: "Supabase" },
-    ];
-
-    const kpiGrid = document.getElementById("kpiCards");
-    kpiGrid.innerHTML = '';
-    kpis.forEach(k => {
-      const dir = k.sub.dir;
-      kpiGrid.innerHTML += '<div class="kpi-card"><div class="kpi-label">' + k.label + '</div><div class="kpi-value">' + k.value + '</div><div class="kpi-sub"><span class="' + dir + '">' + k.sub.pct + ' WoW</span> &middot; ' + k.source + '</div></div>';
-    });
-
-    // ============================================================
-    // CHARTS
-    // ============================================================
-
-    // Demos per week
-    new Chart(document.getElementById("chartDemos"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          { label: "Info Sessions", data: infoSessions, backgroundColor: "#3b82f6aa", borderRadius: 4, barPercentage: 0.7 },
-          { label: "1:1 Demos", data: demosSpecific, backgroundColor: "#6366f1aa", borderRadius: 4, barPercentage: 0.7 },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: "top", labels: { boxWidth: 10, padding: 12 } } },
-        scales: { x: { stacked: true, grid: gridOpts }, y: { stacked: true, beginAtZero: true, grid: gridOpts } }
-      }
-    });
-
-    // New Subscriptions
-    new Chart(document.getElementById("chartSubs"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [{
-          label: "New Subscriptions",
-          data: newSubs,
-          backgroundColor: newSubs.map((v, i) => i === lastIdx ? "#22c55e" : "#22c55e88"),
-          borderRadius: 4, barPercentage: 0.6
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false } },
-        scales: { x: { grid: gridOpts }, y: { beginAtZero: true, grid: gridOpts } }
-      }
-    });
-
-    // Subscription Changes
-    new Chart(document.getElementById("chartChurn"), {
-      type: "line",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          { label: "Cancellations", data: cancellations, borderColor: "#ef4444", backgroundColor: "#ef444422", tension: 0.3, fill: true, pointRadius: 3 },
-          { label: "Upgrades", data: upgrades, borderColor: "#22c55e", backgroundColor: "#22c55e22", tension: 0.3, fill: false, pointRadius: 3 },
-          { label: "Downgrades", data: downgrades, borderColor: "#f59e0b", backgroundColor: "#f59e0b22", tension: 0.3, fill: false, pointRadius: 3 },
-          { label: "Reactivations", data: reactivations, borderColor: "#a855f7", backgroundColor: "#a855f722", tension: 0.3, fill: false, pointRadius: 3 },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: "top", labels: { boxWidth: 10, padding: 12 } } },
-        scales: { x: { grid: gridOpts }, y: { beginAtZero: true, grid: gridOpts } }
-      }
-    });
-
-    // Searches & Estates
-    new Chart(document.getElementById("chartProduct"), {
-      type: "line",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          { label: "Searches", data: searches, borderColor: "#06b6d4", backgroundColor: "#06b6d422", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y" },
-          { label: "New Estates", data: newEstates, borderColor: "#ec4899", backgroundColor: "#ec489922", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y1" },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { position: "top", labels: { boxWidth: 10, padding: 12 } } },
-        scales: {
-          x: { grid: gridOpts },
-          y: { type: "linear", position: "left", beginAtZero: true, grid: gridOpts, title: { display: true, text: "Searches", color: "#06b6d4" } },
-          y1: { type: "linear", position: "right", beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: "Estates", color: "#ec4899" } }
-        }
-      }
-    });
-
-    // Conversion Rate
-    new Chart(document.getElementById("chartConversion"), {
-      type: "line",
-      data: {
-        labels: weekLabels,
-        datasets: [{
-          label: "Demo to Subscription %", data: conversionRate,
-          borderColor: "#6366f1", backgroundColor: "#6366f122",
-          tension: 0.3, fill: true, pointRadius: 4, pointBackgroundColor: "#6366f1"
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: function(ctx) { return ctx.parsed.y + "%"; } } } },
-        scales: { x: { grid: gridOpts }, y: { beginAtZero: true, max: 200, grid: gridOpts, ticks: { callback: function(v) { return v + "%"; } } } }
-      }
-    });
-
-    // Weekly MRR Impact
-    new Chart(document.getElementById("chartPlanBreakdown"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          { label: "New MRR", data: mrrNew, backgroundColor: "#22c55eaa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Impl. Fees", data: mrrImplFee, backgroundColor: "#f59e0baa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Upgrade", data: mrrUpgrade, backgroundColor: "#3b82f6aa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Reactivation", data: mrrReactivation, backgroundColor: "#a855f7aa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Downgrade", data: mrrDowngrade, backgroundColor: "#9ca3afaa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Churn", data: mrrChurn, backgroundColor: "#ef4444aa", borderRadius: 3, barPercentage: 0.7 },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: "top", labels: { boxWidth: 10, padding: 8, font: { size: 10 } } },
-          tooltip: { callbacks: { label: function(ctx) { return ctx.dataset.label + ": $" + ctx.parsed.y.toLocaleString(); } } }
-        },
-        scales: {
-          x: { stacked: true, grid: gridOpts },
-          y: { stacked: true, grid: gridOpts, ticks: { callback: function(v) { return "$" + (v/1000).toFixed(1) + "k"; } } }
-        }
-      }
-    });
-
-    // Implementation Fee Revenue
-    new Chart(document.getElementById("chartImplFee"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          {
-            label: "Impl. Fee Revenue ($)", data: implFeeRevenue,
-            backgroundColor: implFeeRevenue.map(function(v, i) { return i === lastIdx ? "#f59e0b" : "#f59e0b88"; }),
-            borderRadius: 4, barPercentage: 0.5, yAxisID: "y"
-          },
-          {
-            label: "# of Fees Collected", data: implFeeCount,
-            type: "line", borderColor: "#6366f1", backgroundColor: "#6366f122",
-            tension: 0.3, pointRadius: 4, pointBackgroundColor: "#6366f1", fill: false, yAxisID: "y1"
+        if (event.type === 'customer.subscription.created') {
+          weeklyData[wi].newSubs += 1;
+          weeklyData[wi].newMRR += calcMRR(sub);
+        } else if (event.type === 'customer.subscription.deleted') {
+          weeklyData[wi].cancellations += 1;
+          weeklyData[wi].churn -= calcMRR(sub);
+        } else if (event.type === 'customer.subscription.updated') {
+          const prev = event.data.previous_attributes;
+          if (prev && prev.status === 'canceled' && sub.status === 'active') {
+            weeklyData[wi].reactivations += 1;
+            weeklyData[wi].reactivation += calcMRR(sub);
+          } else if (prev && (prev.items || prev.plan)) {
+            const newMrr = calcMRR(sub);
+            const diff = newMrr - calcMRR(sub);
+            if (diff > 0) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
+            else if (diff < 0) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += diff; }
           }
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: "top", labels: { boxWidth: 10, padding: 12 } },
-          tooltip: { callbacks: { label: function(ctx) { return ctx.dataset.label.includes("$") ? "$" + ctx.parsed.y.toLocaleString() : ctx.parsed.y + " fees"; } } }
-        },
-        scales: {
-          x: { grid: gridOpts },
-          y: { type: "linear", position: "left", beginAtZero: true, grid: gridOpts, ticks: { callback: function(v) { return "$" + (v/1000).toFixed(1) + "k"; } }, title: { display: true, text: "Revenue ($)", color: "#f59e0b" } },
-          y1: { type: "linear", position: "right", beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: "Count", color: "#6366f1" } }
         }
       }
-    });
-
-    // ============================================================
-    // WEEKLY TABLE
-    // ============================================================
-
-    const tbody = document.querySelector("#weeklyTable tbody");
-    tbody.innerHTML = '';
-    for (let i = numWeeks - 1; i >= 0; i--) {
-      const conv = totalDemos[i] > 0 ? ((newSubs[i] / totalDemos[i]) * 100).toFixed(0) + "%" : "—";
-      const convClass = totalDemos[i] > 0 ? (newSubs[i]/totalDemos[i] > 0.5 ? "green" : newSubs[i]/totalDemos[i] > 0.2 ? "amber" : "red") : "blue";
-      tbody.innerHTML += '<tr><td style="font-weight:600">' + weekLabels[i] + '</td><td>' + totalDemos[i] + '</td><td>' + newSubs[i] + '</td><td><span class="pill ' + convClass + '">' + conv + '</span></td><td>' + upgrades[i] + '</td><td>' + downgrades[i] + '</td><td>' + reactivations[i] + '</td><td>' + cancellations[i] + '</td><td>' + implFeeCount[i] + '</td><td>$' + implFeeRevenue[i].toLocaleString() + '</td><td>' + searches[i].toLocaleString() + '</td><td>' + newEstates[i] + '</td></tr>';
+      hasMore = data.has_more;
+      if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
     }
-
-    // Update status
-    statusBadge.textContent = 'LIVE DATA';
-    statusBadge.className = 'badge';
-    const now = new Date();
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    dateLabel.textContent = '2026 Year-to-Date \u00b7 Updated ' + months[now.getMonth()] + ' ' + now.getDate();
-
-  } catch (err) {
-    console.error('Dashboard load error:', err);
-    statusBadge.textContent = 'ERROR';
-    statusBadge.className = 'badge error';
-    errorArea.innerHTML = '<div class="error-banner">&#9888; Failed to load dashboard data: ' + err.message + '. Check that API keys are configured in Vercel environment variables.</div>';
-    document.getElementById('kpiCards').innerHTML = '<div class="kpi-card loading-card"><div class="kpi-label">Failed to load data. Please check the browser console for details.</div></div>';
   }
+
+  // 3. Invoices for implementation fees
+  const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
+  hasMore = true;
+  startingAfter = '';
+
+  while (hasMore) {
+    const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
+      '&limit=100&expand[]=data.lines' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+
+    for (const inv of data.data) {
+      const createdAt = new Date(inv.created * 1000);
+      const wi = findWeekIndex(weeks, createdAt);
+      if (wi === -1) continue;
+
+      if (inv.lines && inv.lines.data) {
+        for (const line of inv.lines.data) {
+          const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
+          if (productId === IMPL_PRODUCT) {
+            weeklyData[wi].implFeeCount += 1;
+            weeklyData[wi].implFeeRevenue += (line.amount || 0) / 100;
+          }
+        }
+      }
+    }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+  }
+
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  let monthImplFees = 0;
+  for (let i = 0; i < weeklyData.length; i++) {
+    const ws = new Date(weeks[i]?.start || 0);
+    if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
+  }
+
+  return {
+    currentMRR: Math.round(currentMRR + monthImplFees),
+    currentARR: Math.round((currentMRR + monthImplFees) * 12),
+    weeks: weeklyData
+  };
 }
 
-// Load the dashboard
-loadDashboard();
-</script>
-</body>
-</html>
+// ============================================================
+// HUBSPOT
+// ============================================================
+async function fetchHubSpot(weeks, yearStart) {
+  const TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
+  if (!TOKEN) throw new Error('HUBSPOT_ACCESS_TOKEN not configured');
 
+  const headers = {
+    'Authorization': 'Bearer ' + TOKEN,
+    'Content-Type': 'application/json'
+  };
+
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, demos: 0, infoSessions: 0, demosSpecific: 0, totalDemos: 0, dealsCreated: 0
+  }));
+
+  // 1. Meetings
+  let after = undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'hs_timestamp', operator: 'GTE', value: yearStart.getTime().toString() },
+          { propertyName: 'hs_meeting_outcome', operator: 'HAS_PROPERTY' }
+        ]
+      }],
+      properties: ['hs_meeting_title', 'hs_timestamp', 'hs_meeting_outcome'],
+      sorts: [{ propertyName: 'hs_timestamp', direction: 'ASCENDING' }],
+      limit: 100
+    };
+    if (after) body.after = after;
+
+    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/meetings/search', {
+      method: 'POST', headers, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.status === 'error') throw new Error(data.message || 'HubSpot meetings search failed');
+
+    const meetings = data.results || [];
+    for (const meeting of meetings) {
+      const ts = new Date(meeting.properties.hs_timestamp);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi === -1) continue;
+
+      const title = (meeting.properties.hs_meeting_title || '').toLowerCase();
+      weeklyData[wi].infoSessions += 1;
+      weeklyData[wi].totalDemos += 1;
+      if (title.includes('demo')) weeklyData[wi].demosSpecific += 1;
+    }
+
+    after = data.paging && data.paging.next && data.paging.next.after;
+    hasMore = !!after;
+  }
+
+  // 2. Deals
+  after = undefined;
+  hasMore = true;
+
+  while (hasMore) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'createdate', operator: 'GTE', value: yearStart.getTime().toString() }
+        ]
+      }],
+      properties: ['createdate', 'dealname', 'amount', 'dealstage'],
+      sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
+      limit: 100
+    };
+    if (after) body.after = after;
+
+    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/deals/search', {
+      method: 'POST', headers, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.status === 'error') throw new Error(data.message || 'HubSpot deals search failed');
+
+    const deals = data.results || [];
+    for (const deal of deals) {
+      const ts = new Date(deal.properties.createdate);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].dealsCreated += 1;
+    }
+
+    after = data.paging && data.paging.next && data.paging.next.after;
+    hasMore = !!after;
+  }
+
+  return { weeks: weeklyData };
+}
+
+// ============================================================
+// SUPABASE
+// ============================================================
+async function fetchSupabase(weeks, yearStart) {
+  const SUPA_URL = process.env.SUPABASE_URL;
+  const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!SUPA_URL || !SUPA_KEY) throw new Error('Supabase env vars not configured');
+
+  const headers = {
+    'apikey': SUPA_KEY,
+    'Authorization': 'Bearer ' + SUPA_KEY,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation'
+  };
+
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, searches: 0, newEstates: 0, newSubs: 0
+  }));
+
+  // 1. Searches
+  let allTasks = [];
+  let offset = 0;
+  const batchSize = 1000;
+  let keepGoing = true;
+
+  while (keepGoing) {
+    const url = SUPA_URL + '/rest/v1/estate_task?select=id,createdAt,label,estateId' +
+      '&createdAt=gte.' + yearStart.toISOString() +
+      '&label=ilike.*search*' +
+      '&order=createdAt.asc' +
+      '&offset=' + offset + '&limit=' + batchSize;
+
+    const resp = await fetch(url, { headers });
+    if (!resp.ok) { console.error('Supabase estate_task error:', resp.status); break; }
+    const data = await resp.json();
+    if (!data || data.length === 0) { keepGoing = false; break; }
+    allTasks = allTasks.concat(data);
+    offset += batchSize;
+    if (data.length < batchSize) keepGoing = false;
+  }
+
+  // Exclude Mendelsohn estates
+  const exclUrl = SUPA_URL + '/rest/v1/estate?select=id&portalId=eq.' + MENDELSOHN_PORTAL_ID;
+  const exclResp = await fetch(exclUrl, { headers });
+  const exclData = exclResp.ok ? await exclResp.json() : [];
+  const excludedIds = new Set(exclData.map(e => e.id));
+
+  for (const task of allTasks) {
+    if (excludedIds.has(task.estateId)) continue;
+    const ts = new Date(task.createdAt);
+    const wi = findWeekIndex(weeks, ts);
+    if (wi !== -1) weeklyData[wi].searches += 1;
+  }
+
+  // 2. New estates
+  const estateUrl = SUPA_URL + '/rest/v1/estate?select=id,createdAt,portalId' +
+    '&createdAt=gte.' + yearStart.toISOString() +
+    '&portalId=neq.' + MENDELSOHN_PORTAL_ID +
+    '&order=createdAt.asc&limit=10000';
+
+  const estateResp = await fetch(estateUrl, { headers });
+  if (estateResp.ok) {
+    const estates = await estateResp.json();
+    for (const estate of estates) {
+      const ts = new Date(estate.createdAt);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].newEstates += 1;
+    }
+  }
+
+  // 3. New subscriptions
+  const subUrl = SUPA_URL + '/rest/v1/feature_subscription?select=id,createdAt' +
+    '&createdAt=gte.' + yearStart.toISOString() +
+    '&order=createdAt.asc&limit=10000';
+
+  const subResp = await fetch(subUrl, { headers });
+  if (subResp.ok) {
+    const subs = await subResp.json();
+    for (const sub of subs) {
+      const ts = new Date(sub.createdAt);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].newSubs += 1;
+    }
+  }
+
+  return { weeks: weeklyData };
+}
+
+// ============================================================
+// SHARED HELPERS
+// ============================================================
+function calcMRR(sub) {
+  let mrr = 0;
+  if (sub.items && sub.items.data) {
+    for (const item of sub.items.data) {
+      const price = item.price || item.plan;
+      if (!price) continue;
+      const amount = (price.unit_amount || 0) / 100;
+      const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+      const qty = item.quantity || 1;
+      mrr += interval === 'year' ? (amount * qty) / 12 : amount * qty;
+    }
+  }
+  return Math.round(mrr * 100) / 100;
+}
+
+function getWeekBuckets(yearStart) {
+  const weeks = [];
+  const d = new Date(yearStart);
+  const day = d.getUTCDay();
+  d.setUTCDate(d.getUTCDate() + (day === 0 ? -6 : 1 - day));
+  const now = new Date();
+  const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  while (d < now) {
+    const end = new Date(d); end.setUTCDate(end.getUTCDate() + 6);
+    weeks.push({ label: monthNames[d.getUTCMonth()] + ' ' + d.getUTCDate(), start: d.toISOString(), end: end.toISOString() });
+    d.setUTCDate(d.getUTCDate() + 7);
+  }
+  return weeks;
+}
+
+function findWeekIndex(weeks, date) {
+  for (let i = 0; i < weeks.length; i++) {
+    if (date >= new Date(weeks[i].start) && date <= new Date(weeks[i].end)) return i;
+  }
+  return -1;
+}
