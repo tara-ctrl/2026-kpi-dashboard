@@ -108,6 +108,7 @@ async function fetchStripe(weeks, yearStart, now) {
   let monthlyRevenue = 0;
   let newRevenueThisMonth = 0;
   let newRevenuePriorMonth = 0;
+  let newMRRThisMonth = 0; // MRR from subs created this month (for MoM calc)
   let hasMore = true;
   let startingAfter = '';
   let pages = 0;
@@ -134,13 +135,11 @@ async function fetchStripe(weeks, yearStart, now) {
       // Track new revenue by month (actual billing amount, not MRR)
       // This matches Stripe's "subscription creation" payment amounts
       const subCreated = new Date(sub.created * 1000);
-      if (subCreated >= currentMonthStart || subCreated >= priorMonthStart) {
-        const billingAmount = calcBillingAmount(sub);
-        if (subCreated >= currentMonthStart) {
-          newRevenueThisMonth += billingAmount;
-        } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
-          newRevenuePriorMonth += billingAmount;
-        }
+      if (subCreated >= currentMonthStart) {
+        newRevenueThisMonth += calcBillingAmount(sub);
+        newMRRThisMonth += mrr; // track MRR from new subs for MoM calculation
+      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+        newRevenuePriorMonth += calcBillingAmount(sub);
       }
 
       let isAnnual = false;
@@ -212,6 +211,53 @@ async function fetchStripe(weeks, yearStart, now) {
     pages++;
   }
 
+  // 3. Cancellations this month — fetch canceled subs, filter by canceled_at
+  hasMore = true;
+  startingAfter = '';
+  pages = 0;
+  let cancelVoluntary = 0;
+  let cancelFailedPayment = 0;
+  let cancelOther = 0;
+  let cancelMRRLost = 0;
+  const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
+
+  while (hasMore && pages < 3) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/subscriptions?status=canceled&limit=100' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('cancel_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) throw new Error('Stripe cancel error: ' + data.error.message);
+
+    let foundOlder = false;
+    for (const sub of data.data) {
+      const canceledAt = sub.canceled_at || 0;
+      if (canceledAt < currentMonthUnix) { foundOlder = true; continue; }
+
+      const lostMRR = calcMRR(sub);
+      cancelMRRLost += lostMRR;
+
+      const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
+      if (reason === 'payment_failed' || reason === 'payment_disputed') {
+        cancelFailedPayment += 1;
+      } else if (reason === 'cancellation_requested') {
+        cancelVoluntary += 1;
+      } else {
+        cancelOther += 1;
+      }
+    }
+
+    // Stop if we've gone past current month (canceled subs are returned newest first)
+    if (foundOlder && !data.has_more) break;
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
+    // If most results are older than current month, stop early
+    if (foundOlder) break;
+  }
+
   timings.push('total:' + (Date.now() - t0) + 'ms');
 
   // Roll current month's impl fee revenue into MRR
@@ -227,9 +273,14 @@ async function fetchStripe(weeks, yearStart, now) {
   const ADDON_ADJUSTMENT = 14000;
   const mrrWithImpl = currentMRR + monthImplFees + ADDON_ADJUSTMENT;
 
+  // Prior month MRR = current MRR minus MRR from subs created this month
+  // (those subs didn't exist last month)
+  const priorMonthMRR = mrrWithImpl - newMRRThisMonth;
+
   return {
     currentMRR: Math.round(mrrWithImpl),
     currentARR: Math.round(mrrWithImpl * 12),
+    priorMonthMRR: Math.round(priorMonthMRR),
     subscriptionMRR: Math.round(currentMRR),
     implFeesMRR: Math.round(monthImplFees),
     totalActiveSubs: totalActiveSubs,
@@ -239,6 +290,11 @@ async function fetchStripe(weeks, yearStart, now) {
     monthlyRevenue: Math.round(monthlyRevenue),
     newRevenueThisMonth: Math.round(newRevenueThisMonth),
     newRevenuePriorMonth: Math.round(newRevenuePriorMonth),
+    cancelTotal: cancelVoluntary + cancelFailedPayment + cancelOther,
+    cancelVoluntary: cancelVoluntary,
+    cancelFailedPayment: cancelFailedPayment,
+    cancelOther: cancelOther,
+    cancelMRRLost: Math.round(cancelMRRLost),
     implFeeCount: totalImplFeeCount,
     implFeeRevenue: Math.round(totalImplFeeRevenue),
     timings: timings,
