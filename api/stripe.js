@@ -106,9 +106,15 @@ async function fetchStripe(weeks, yearStart, now) {
   let monthlySubs = 0;
   let annualRevenue = 0;
   let monthlyRevenue = 0;
+  let newRevenueThisMonth = 0;
+  let newRevenuePriorMonth = 0;
   let hasMore = true;
   let startingAfter = '';
   let pages = 0;
+
+  // Date boundaries for current and prior month
+  const currentMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  const priorMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
 
   while (hasMore && pages < MAX_PAGES) {
     const pt = Date.now();
@@ -124,6 +130,14 @@ async function fetchStripe(weeks, yearStart, now) {
       const mrr = calcMRR(sub);
       currentMRR += mrr;
       totalActiveSubs += 1;
+
+      // Track new revenue by month (based on subscription created date)
+      const subCreated = new Date(sub.created * 1000);
+      if (subCreated >= currentMonthStart) {
+        newRevenueThisMonth += mrr;
+      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+        newRevenuePriorMonth += mrr;
+      }
 
       let isAnnual = false;
       if (sub.items && sub.items.data) {
@@ -219,6 +233,8 @@ async function fetchStripe(weeks, yearStart, now) {
     monthlySubs: monthlySubs,
     annualRevenue: Math.round(annualRevenue),
     monthlyRevenue: Math.round(monthlyRevenue),
+    newRevenueThisMonth: Math.round(newRevenueThisMonth),
+    newRevenuePriorMonth: Math.round(newRevenuePriorMonth),
     implFeeCount: totalImplFeeCount,
     implFeeRevenue: Math.round(totalImplFeeRevenue),
     timings: timings,
