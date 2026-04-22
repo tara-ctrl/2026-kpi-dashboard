@@ -131,12 +131,16 @@ async function fetchStripe(weeks, yearStart, now) {
       currentMRR += mrr;
       totalActiveSubs += 1;
 
-      // Track new revenue by month (based on subscription created date)
+      // Track new revenue by month (actual billing amount, not MRR)
+      // This matches Stripe's "subscription creation" payment amounts
       const subCreated = new Date(sub.created * 1000);
-      if (subCreated >= currentMonthStart) {
-        newRevenueThisMonth += mrr;
-      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
-        newRevenuePriorMonth += mrr;
+      if (subCreated >= currentMonthStart || subCreated >= priorMonthStart) {
+        const billingAmount = calcBillingAmount(sub);
+        if (subCreated >= currentMonthStart) {
+          newRevenueThisMonth += billingAmount;
+        } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+          newRevenuePriorMonth += billingAmount;
+        }
       }
 
       let isAnnual = false;
@@ -445,6 +449,22 @@ function calcMRR(sub) {
     }
   }
   return Math.round(mrr * 100) / 100;
+}
+
+// Actual billing amount (what Stripe charges per billing cycle, not normalized to monthly)
+// This matches Stripe's "subscription creation" payment amounts
+function calcBillingAmount(sub) {
+  let total = 0;
+  if (sub.items && sub.items.data) {
+    for (const item of sub.items.data) {
+      const price = item.price || item.plan;
+      if (!price) continue;
+      const amount = (price.unit_amount || 0) / 100;
+      const qty = item.quantity || 1;
+      total += amount * qty;
+    }
+  }
+  return Math.round(total * 100) / 100;
 }
 
 function getWeekBuckets(yearStart) {
