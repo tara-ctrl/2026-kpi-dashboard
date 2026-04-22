@@ -8,16 +8,16 @@ fs.mkdirSync(outDir + '/static', { recursive: true });
 // Copy static files
 fs.copyFileSync('public/index.html', outDir + '/static/index.html');
 
-// Create serverless functions
-const functions = ['stripe', 'hubspot', 'supabase'];
-const vcConfig = JSON.stringify({ runtime: 'nodejs20.x', handler: 'index.js', launcherType: 'Nodejs' });
-
-for (const fn of functions) {
-  const funcDir = outDir + '/functions/api/' + fn + '.func';
-  fs.mkdirSync(funcDir, { recursive: true });
-  fs.copyFileSync('api/' + fn + '.js', funcDir + '/index.js');
-  fs.writeFileSync(funcDir + '/.vc-config.json', vcConfig);
-}
+// Create the unified API function (stripe.js handles all three data sources)
+const funcDir = outDir + '/functions/api/stripe.func';
+fs.mkdirSync(funcDir, { recursive: true });
+fs.copyFileSync('api/stripe.js', funcDir + '/index.js');
+fs.writeFileSync(funcDir + '/.vc-config.json', JSON.stringify({
+  runtime: 'nodejs20.x',
+  handler: 'index.js',
+  launcherType: 'Nodejs',
+  maxDuration: 30
+}));
 
 // Create output config
 const config = {
@@ -29,4 +29,4 @@ const config = {
 };
 fs.writeFileSync(outDir + '/config.json', JSON.stringify(config, null, 2));
 
-console.log('Build complete: static files + 3 serverless functions');
+console.log('Build complete: static files + 1 unified serverless function');
