@@ -196,9 +196,21 @@ async function fetchStripe(weeks, yearStart, now) {
 
   timings.push('total:' + (Date.now() - t0) + 'ms');
 
+  // Roll current month's impl fee revenue into MRR
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  let monthImplFees = 0;
+  for (let i = 0; i < weeklyData.length; i++) {
+    const ws = new Date(weeks[i]?.start || 0);
+    if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
+  }
+
+  const mrrWithImpl = currentMRR + monthImplFees;
+
   return {
-    currentMRR: Math.round(currentMRR),
-    currentARR: Math.round(currentMRR * 12),
+    currentMRR: Math.round(mrrWithImpl),
+    currentARR: Math.round(mrrWithImpl * 12),
+    subscriptionMRR: Math.round(currentMRR),
+    implFeesMRR: Math.round(monthImplFees),
     totalActiveSubs: totalActiveSubs,
     annualSubs: annualSubs,
     monthlySubs: monthlySubs,
