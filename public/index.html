@@ -187,6 +187,11 @@ async function loadDashboard() {
       errorArea.innerHTML = '<div class="error-banner">&#9888; Some data sources had errors: ' + data.errors.join('; ') + '</div>';
     }
 
+    // Show Stripe timing diagnostics if available
+    if (data.stripe && data.stripe.timings) {
+      errorArea.innerHTML += '<div class="note-banner">Stripe timing: ' + data.stripe.timings.join(' | ') + '</div>';
+    }
+
     const stripeWeeks = (data.stripe && data.stripe.weeks) || [];
     const hubspotWeeks = (data.hubspot && data.hubspot.weeks) || [];
     const supabaseWeeks = (data.supabase && data.supabase.weeks) || [];
@@ -236,14 +241,18 @@ async function loadDashboard() {
     // COMPUTED METRICS
     // ============================================================
 
-    // Stripe top-level metrics
+    // Stripe top-level metrics (MRR now includes current month impl fees)
     const currentMRR = (data.stripe && data.stripe.currentMRR) || 0;
     const currentARR = (data.stripe && data.stripe.currentARR) || 0;
+    const subscriptionMRR = (data.stripe && data.stripe.subscriptionMRR) || 0;
+    const implFeesMRR = (data.stripe && data.stripe.implFeesMRR) || 0;
     const totalActiveSubs = (data.stripe && data.stripe.totalActiveSubs) || 0;
     const annualSubs = (data.stripe && data.stripe.annualSubs) || 0;
     const monthlySubs = (data.stripe && data.stripe.monthlySubs) || 0;
     const annualRevenue = (data.stripe && data.stripe.annualRevenue) || 0;
     const monthlyRevenue = (data.stripe && data.stripe.monthlyRevenue) || 0;
+    const newRevenueThisMonth = (data.stripe && data.stripe.newRevenueThisMonth) || 0;
+    const newRevenuePriorMonth = (data.stripe && data.stripe.newRevenuePriorMonth) || 0;
     const stripeImplFeeCount = (data.stripe && data.stripe.implFeeCount) || 0;
     const stripeImplFeeRevenue = (data.stripe && data.stripe.implFeeRevenue) || 0;
 
@@ -268,11 +277,11 @@ async function loadDashboard() {
     // ============================================================
 
     const kpis = [
-      { label: "Current MRR", value: "$" + currentMRR.toLocaleString(), sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
+      { label: "Current MRR", value: "$" + currentMRR.toLocaleString(), sub: { pct: "$" + subscriptionMRR.toLocaleString() + " subs + $" + implFeesMRR.toLocaleString() + " impl fees", dir: "neutral" }, source: "Stripe" },
       { label: "Current ARR", value: "$" + currentARR.toLocaleString(), sub: { pct: "Live", dir: "neutral" }, source: "Stripe" },
       { label: "Active Subscriptions", value: totalActiveSubs, sub: { pct: monthlySubs + " monthly / " + annualSubs + " annual", dir: "neutral" }, source: "Stripe" },
-      { label: "Monthly Sub Revenue", value: "$" + monthlyRevenue.toLocaleString() + "/mo", sub: { pct: monthlySubs + " subs", dir: "neutral" }, source: "Stripe" },
-      { label: "Annual Sub Revenue", value: "$" + annualRevenue.toLocaleString() + "/yr", sub: { pct: annualSubs + " subs", dir: "neutral" }, source: "Stripe" },
+      { label: "New Revenue This Month", value: "$" + newRevenueThisMonth.toLocaleString(), sub: { pct: "From new subscriptions started this month", dir: "neutral" }, source: "Stripe" },
+      { label: "MoM Gross Growth", value: (function() { if (newRevenuePriorMonth === 0) return "N/A"; var pct = ((newRevenueThisMonth - newRevenuePriorMonth) / newRevenuePriorMonth * 100).toFixed(1); return (pct > 0 ? "+" : "") + pct + "%"; })(), sub: { pct: "$" + newRevenuePriorMonth.toLocaleString() + " new rev last month", dir: newRevenuePriorMonth === 0 ? "neutral" : (newRevenueThisMonth >= newRevenuePriorMonth ? "up" : "down") }, source: "Stripe" },
       { label: "Impl. Fees (YTD)", value: "$" + stripeImplFeeRevenue.toLocaleString(), sub: { pct: stripeImplFeeCount + " fees collected", dir: "neutral" }, source: "Stripe" },
       { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
       { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
