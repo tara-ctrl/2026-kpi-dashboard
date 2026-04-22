@@ -4,8 +4,9 @@
 // Optimized with timeouts and pagination limits to avoid serverless timeout
 
 const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
-const MAX_PAGES = 10; // Max pagination pages per endpoint to prevent timeout
-const FETCH_TIMEOUT = 8000; // 8s timeout per individual API call
+const MAX_PAGES = 5; // Max pagination pages per endpoint to prevent timeout
+const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
+const SERVICE_TIMEOUT = 20000; // 20s max per service
 
 // Helper: fetch with timeout
 async function fetchWithTimeout(url, options, timeout = FETCH_TIMEOUT) {
@@ -32,59 +33,45 @@ module.exports = async (req, res) => {
   const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
   const weeks = getWeekBuckets(yearStart);
 
-  // Run all three fetches in parallel with a 25s global timeout
-  const globalTimeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error('Global timeout')), 25000)
-  );
-
-  let stripeResult, hubspotResult, supabaseResult;
-
-  try {
-    [stripeResult, hubspotResult, supabaseResult] = await Promise.race([
-      Promise.allSettled([
-        fetchStripe(weeks, yearStart, now),
-        fetchHubSpot(weeks, yearStart),
-        fetchSupabase(weeks, yearStart)
-      ]),
-      globalTimeout.then(() => { throw new Error('Global timeout'); })
+  // Wrap each service in its own timeout so partial results still come through
+  function withTimeout(promise, ms, name) {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(name + ' timed out after ' + (ms/1000) + 's')), ms))
     ]);
-  } catch (e) {
-    // Global timeout — return empty data with error
-    return res.status(200).json({
-      stripe: { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) },
-      hubspot: { weeks: weeks.map(w => ({ weekOf: w.label })) },
-      supabase: { weeks: weeks.map(w => ({ weekOf: w.label })) },
-      errors: ['Function timed out. Data sources may be slow. Try refreshing.']
-    });
   }
+
+  // Run all three fetches in parallel — each has its own timeout
+  const [stripeResult, hubspotResult, supabaseResult] = await Promise.allSettled([
+    withTimeout(fetchStripe(weeks, yearStart, now), SERVICE_TIMEOUT, 'Stripe'),
+    withTimeout(fetchHubSpot(weeks, yearStart), SERVICE_TIMEOUT, 'HubSpot'),
+    withTimeout(fetchSupabase(weeks, yearStart), SERVICE_TIMEOUT, 'Supabase')
+  ]);
 
   const response = {};
   const errors = [];
 
   // Stripe
-  if (stripeResult && stripeResult.status === 'fulfilled') {
+  if (stripeResult.status === 'fulfilled') {
     response.stripe = stripeResult.value;
   } else {
-    const msg = stripeResult ? stripeResult.reason.message : 'Stripe timed out';
-    errors.push('Stripe: ' + msg);
+    errors.push('Stripe: ' + stripeResult.reason.message);
     response.stripe = { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
   // HubSpot
-  if (hubspotResult && hubspotResult.status === 'fulfilled') {
+  if (hubspotResult.status === 'fulfilled') {
     response.hubspot = hubspotResult.value;
   } else {
-    const msg = hubspotResult ? hubspotResult.reason.message : 'HubSpot timed out';
-    errors.push('HubSpot: ' + msg);
+    errors.push('HubSpot: ' + hubspotResult.reason.message);
     response.hubspot = { weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
   // Supabase
-  if (supabaseResult && supabaseResult.status === 'fulfilled') {
+  if (supabaseResult.status === 'fulfilled') {
     response.supabase = supabaseResult.value;
   } else {
-    const msg = supabaseResult ? supabaseResult.reason.message : 'Supabase timed out';
-    errors.push('Supabase: ' + msg);
+    errors.push('Supabase: ' + supabaseResult.reason.message);
     response.supabase = { weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
