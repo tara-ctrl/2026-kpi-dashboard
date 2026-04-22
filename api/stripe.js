@@ -1,48 +1,90 @@
 // /api/stripe — Unified endpoint: fetches from Stripe, HubSpot, AND Supabase
 // Uses native fetch — no npm packages required
 // Returns combined data from all three sources in one response
+// Optimized with timeouts and pagination limits to avoid serverless timeout
 
 const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
+const MAX_PAGES = 10; // Max pagination pages per endpoint to prevent timeout
+const FETCH_TIMEOUT = 8000; // 8s timeout per individual API call
+
+// Helper: fetch with timeout
+async function fetchWithTimeout(url, options, timeout = FETCH_TIMEOUT) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    clearTimeout(timer);
+    return resp;
+  } catch (e) {
+    clearTimeout(timer);
+    if (e.name === 'AbortError') throw new Error('Request timed out');
+    throw e;
+  }
+}
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
   const now = new Date();
   const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
   const weeks = getWeekBuckets(yearStart);
 
-  // Run all three fetches in parallel
-  const [stripeResult, hubspotResult, supabaseResult] = await Promise.allSettled([
-    fetchStripe(weeks, yearStart, now),
-    fetchHubSpot(weeks, yearStart),
-    fetchSupabase(weeks, yearStart)
-  ]);
+  // Run all three fetches in parallel with a 25s global timeout
+  const globalTimeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('Global timeout')), 25000)
+  );
+
+  let stripeResult, hubspotResult, supabaseResult;
+
+  try {
+    [stripeResult, hubspotResult, supabaseResult] = await Promise.race([
+      Promise.allSettled([
+        fetchStripe(weeks, yearStart, now),
+        fetchHubSpot(weeks, yearStart),
+        fetchSupabase(weeks, yearStart)
+      ]),
+      globalTimeout.then(() => { throw new Error('Global timeout'); })
+    ]);
+  } catch (e) {
+    // Global timeout — return empty data with error
+    return res.status(200).json({
+      stripe: { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) },
+      hubspot: { weeks: weeks.map(w => ({ weekOf: w.label })) },
+      supabase: { weeks: weeks.map(w => ({ weekOf: w.label })) },
+      errors: ['Function timed out. Data sources may be slow. Try refreshing.']
+    });
+  }
 
   const response = {};
   const errors = [];
 
   // Stripe
-  if (stripeResult.status === 'fulfilled') {
+  if (stripeResult && stripeResult.status === 'fulfilled') {
     response.stripe = stripeResult.value;
   } else {
-    errors.push('Stripe: ' + stripeResult.reason.message);
+    const msg = stripeResult ? stripeResult.reason.message : 'Stripe timed out';
+    errors.push('Stripe: ' + msg);
     response.stripe = { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
   // HubSpot
-  if (hubspotResult.status === 'fulfilled') {
+  if (hubspotResult && hubspotResult.status === 'fulfilled') {
     response.hubspot = hubspotResult.value;
   } else {
-    errors.push('HubSpot: ' + hubspotResult.reason.message);
+    const msg = hubspotResult ? hubspotResult.reason.message : 'HubSpot timed out';
+    errors.push('HubSpot: ' + msg);
     response.hubspot = { weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
   // Supabase
-  if (supabaseResult.status === 'fulfilled') {
+  if (supabaseResult && supabaseResult.status === 'fulfilled') {
     response.supabase = supabaseResult.value;
   } else {
-    errors.push('Supabase: ' + supabaseResult.reason.message);
+    const msg = supabaseResult ? supabaseResult.reason.message : 'Supabase timed out';
+    errors.push('Supabase: ' + msg);
     response.supabase = { weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
 
@@ -71,11 +113,12 @@ async function fetchStripe(weeks, yearStart, now) {
   let currentMRR = 0;
   let hasMore = true;
   let startingAfter = '';
+  let pages = 0;
 
-  while (hasMore) {
+  while (hasMore && pages < MAX_PAGES) {
     const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
+    const resp = await fetchWithTimeout(url, { headers });
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
 
@@ -84,9 +127,10 @@ async function fetchStripe(weeks, yearStart, now) {
     }
     hasMore = data.has_more;
     if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
   }
 
-  // 2. Subscription events
+  // 2. Subscription events (limit pages per event type)
   const eventTypes = [
     'customer.subscription.created',
     'customer.subscription.deleted',
@@ -96,11 +140,12 @@ async function fetchStripe(weeks, yearStart, now) {
   for (const eventType of eventTypes) {
     hasMore = true;
     startingAfter = '';
-    while (hasMore) {
+    pages = 0;
+    while (hasMore && pages < MAX_PAGES) {
       const url = 'https://api.stripe.com/v1/events?type=' + eventType +
         '&created[gte]=' + yearStartUnix + '&limit=100' +
         (startingAfter ? '&starting_after=' + startingAfter : '');
-      const resp = await fetch(url, { headers });
+      const resp = await fetchWithTimeout(url, { headers });
       const data = await resp.json();
       if (data.error) throw new Error(data.error.message);
 
@@ -122,8 +167,21 @@ async function fetchStripe(weeks, yearStart, now) {
             weeklyData[wi].reactivations += 1;
             weeklyData[wi].reactivation += calcMRR(sub);
           } else if (prev && (prev.items || prev.plan)) {
-            const newMrr = calcMRR(sub);
-            const diff = newMrr - calcMRR(sub);
+            const currentMrrVal = calcMRR(sub);
+            // Estimate previous MRR from the previous_attributes if available
+            let prevMrr = currentMrrVal;
+            if (prev.items && prev.items.data) {
+              prevMrr = 0;
+              for (const item of prev.items.data) {
+                const price = item.price || item.plan;
+                if (!price) continue;
+                const amount = (price.unit_amount || 0) / 100;
+                const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+                const qty = item.quantity || 1;
+                prevMrr += interval === 'year' ? (amount * qty) / 12 : amount * qty;
+              }
+            }
+            const diff = currentMrrVal - prevMrr;
             if (diff > 0) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
             else if (diff < 0) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += diff; }
           }
@@ -131,6 +189,7 @@ async function fetchStripe(weeks, yearStart, now) {
       }
       hasMore = data.has_more;
       if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+      pages++;
     }
   }
 
@@ -138,12 +197,13 @@ async function fetchStripe(weeks, yearStart, now) {
   const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
   hasMore = true;
   startingAfter = '';
+  pages = 0;
 
-  while (hasMore) {
+  while (hasMore && pages < MAX_PAGES) {
     const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
       '&limit=100&expand[]=data.lines' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
+    const resp = await fetchWithTimeout(url, { headers });
     const data = await resp.json();
     if (data.error) throw new Error(data.error.message);
 
@@ -164,6 +224,7 @@ async function fetchStripe(weeks, yearStart, now) {
     }
     hasMore = data.has_more;
     if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
   }
 
   const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
@@ -199,8 +260,9 @@ async function fetchHubSpot(weeks, yearStart) {
   // 1. Meetings
   let after = undefined;
   let hasMore = true;
+  let pages = 0;
 
-  while (hasMore) {
+  while (hasMore && pages < MAX_PAGES) {
     const body = {
       filterGroups: [{
         filters: [
@@ -214,7 +276,7 @@ async function fetchHubSpot(weeks, yearStart) {
     };
     if (after) body.after = after;
 
-    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/meetings/search', {
+    const resp = await fetchWithTimeout('https://api.hubapi.com/crm/v3/objects/meetings/search', {
       method: 'POST', headers, body: JSON.stringify(body)
     });
     const data = await resp.json();
@@ -234,13 +296,15 @@ async function fetchHubSpot(weeks, yearStart) {
 
     after = data.paging && data.paging.next && data.paging.next.after;
     hasMore = !!after;
+    pages++;
   }
 
   // 2. Deals
   after = undefined;
   hasMore = true;
+  pages = 0;
 
-  while (hasMore) {
+  while (hasMore && pages < MAX_PAGES) {
     const body = {
       filterGroups: [{
         filters: [
@@ -253,7 +317,7 @@ async function fetchHubSpot(weeks, yearStart) {
     };
     if (after) body.after = after;
 
-    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/deals/search', {
+    const resp = await fetchWithTimeout('https://api.hubapi.com/crm/v3/objects/deals/search', {
       method: 'POST', headers, body: JSON.stringify(body)
     });
     const data = await resp.json();
@@ -268,6 +332,7 @@ async function fetchHubSpot(weeks, yearStart) {
 
     after = data.paging && data.paging.next && data.paging.next.after;
     hasMore = !!after;
+    pages++;
   }
 
   return { weeks: weeklyData };
@@ -292,31 +357,33 @@ async function fetchSupabase(weeks, yearStart) {
     weekOf: w.label, searches: 0, newEstates: 0, newSubs: 0
   }));
 
-  // 1. Searches
+  // 1. Searches (limit to 5000 max)
   let allTasks = [];
   let offset = 0;
   const batchSize = 1000;
   let keepGoing = true;
+  let pages = 0;
 
-  while (keepGoing) {
+  while (keepGoing && pages < 5) {
     const url = SUPA_URL + '/rest/v1/estate_task?select=id,createdAt,label,estateId' +
       '&createdAt=gte.' + yearStart.toISOString() +
       '&label=ilike.*search*' +
       '&order=createdAt.asc' +
       '&offset=' + offset + '&limit=' + batchSize;
 
-    const resp = await fetch(url, { headers });
+    const resp = await fetchWithTimeout(url, { headers });
     if (!resp.ok) { console.error('Supabase estate_task error:', resp.status); break; }
     const data = await resp.json();
     if (!data || data.length === 0) { keepGoing = false; break; }
     allTasks = allTasks.concat(data);
     offset += batchSize;
     if (data.length < batchSize) keepGoing = false;
+    pages++;
   }
 
   // Exclude Mendelsohn estates
   const exclUrl = SUPA_URL + '/rest/v1/estate?select=id&portalId=eq.' + MENDELSOHN_PORTAL_ID;
-  const exclResp = await fetch(exclUrl, { headers });
+  const exclResp = await fetchWithTimeout(exclUrl, { headers });
   const exclData = exclResp.ok ? await exclResp.json() : [];
   const excludedIds = new Set(exclData.map(e => e.id));
 
@@ -333,7 +400,7 @@ async function fetchSupabase(weeks, yearStart) {
     '&portalId=neq.' + MENDELSOHN_PORTAL_ID +
     '&order=createdAt.asc&limit=10000';
 
-  const estateResp = await fetch(estateUrl, { headers });
+  const estateResp = await fetchWithTimeout(estateUrl, { headers });
   if (estateResp.ok) {
     const estates = await estateResp.json();
     for (const estate of estates) {
@@ -348,7 +415,7 @@ async function fetchSupabase(weeks, yearStart) {
     '&createdAt=gte.' + yearStart.toISOString() +
     '&order=createdAt.asc&limit=10000';
 
-  const subResp = await fetch(subUrl, { headers });
+  const subResp = await fetchWithTimeout(subUrl, { headers });
   if (subResp.ok) {
     const subs = await subResp.json();
     for (const sub of subs) {
