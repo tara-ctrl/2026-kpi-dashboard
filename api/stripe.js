@@ -1,144 +1,369 @@
-// /api/stripe — Fetches MRR, subscription events, and impl fees from Stripe
+// /api/stripe — Unified endpoint: fetches from Stripe, HubSpot, AND Supabase
 // Uses native fetch — no npm packages required
+// Returns combined data from all three sources in one response
+
+const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   if (req.method === 'OPTIONS') return res.status(200).end();
 
-  try {
-    const SK = process.env.STRIPE_SECRET_KEY;
-    if (!SK) throw new Error('STRIPE_SECRET_KEY not configured');
+  const now = new Date();
+  const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+  const weeks = getWeekBuckets(yearStart);
 
-    const headers = { 'Authorization': 'Bearer ' + SK };
-    const now = new Date();
-    const yearStart = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
-    const yearStartUnix = Math.floor(yearStart.getTime() / 1000);
-    const weeks = getWeekBuckets(yearStart);
+  // Run all three fetches in parallel
+  const [stripeResult, hubspotResult, supabaseResult] = await Promise.allSettled([
+    fetchStripe(weeks, yearStart, now),
+    fetchHubSpot(weeks, yearStart),
+    fetchSupabase(weeks, yearStart)
+  ]);
 
-    const weeklyData = weeks.map(w => ({
-      weekOf: w.label, newMRR: 0, churn: 0, upgrade: 0, downgrade: 0,
-      reactivation: 0, implFeeCount: 0, implFeeRevenue: 0,
-      cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
-    }));
+  const response = {};
+  const errors = [];
 
-    // --- 1. Active subscriptions for current MRR ---
-    let currentMRR = 0;
-    let hasMore = true;
-    let startingAfter = '';
-
-    while (hasMore) {
-      const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
-        (startingAfter ? '&starting_after=' + startingAfter : '');
-      const resp = await fetch(url, { headers });
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error.message);
-
-      for (const sub of data.data) {
-        currentMRR += calcMRR(sub);
-      }
-      hasMore = data.has_more;
-      if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    }
-
-    // --- 2. Subscription events (created, deleted, updated) ---
-    const eventTypes = [
-      'customer.subscription.created',
-      'customer.subscription.deleted',
-      'customer.subscription.updated'
-    ];
-
-    for (const eventType of eventTypes) {
-      hasMore = true;
-      startingAfter = '';
-      while (hasMore) {
-        const url = 'https://api.stripe.com/v1/events?type=' + eventType +
-          '&created[gte]=' + yearStartUnix + '&limit=100' +
-          (startingAfter ? '&starting_after=' + startingAfter : '');
-        const resp = await fetch(url, { headers });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error.message);
-
-        for (const event of data.data) {
-          const createdAt = new Date(event.created * 1000);
-          const wi = findWeekIndex(weeks, createdAt);
-          if (wi === -1) continue;
-          const sub = event.data.object;
-
-          if (event.type === 'customer.subscription.created') {
-            weeklyData[wi].newSubs += 1;
-            weeklyData[wi].newMRR += calcMRR(sub);
-          } else if (event.type === 'customer.subscription.deleted') {
-            weeklyData[wi].cancellations += 1;
-            weeklyData[wi].churn -= calcMRR(sub);
-          } else if (event.type === 'customer.subscription.updated') {
-            const prev = event.data.previous_attributes;
-            if (prev && prev.status === 'canceled' && sub.status === 'active') {
-              weeklyData[wi].reactivations += 1;
-              weeklyData[wi].reactivation += calcMRR(sub);
-            } else if (prev && (prev.items || prev.plan)) {
-              const newMrr = calcMRR(sub);
-              const diff = newMrr - calcMRR(sub); // approximate
-              if (diff > 0) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
-              else if (diff < 0) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += diff; }
-            }
-          }
-        }
-        hasMore = data.has_more;
-        if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-      }
-    }
-
-    // --- 3. Invoices for implementation fees ---
-    const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
-    hasMore = true;
-    startingAfter = '';
-
-    while (hasMore) {
-      const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
-        '&limit=100&expand[]=data.lines' +
-        (startingAfter ? '&starting_after=' + startingAfter : '');
-      const resp = await fetch(url, { headers });
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error.message);
-
-      for (const inv of data.data) {
-        const createdAt = new Date(inv.created * 1000);
-        const wi = findWeekIndex(weeks, createdAt);
-        if (wi === -1) continue;
-
-        if (inv.lines && inv.lines.data) {
-          for (const line of inv.lines.data) {
-            const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
-            if (productId === IMPL_PRODUCT) {
-              weeklyData[wi].implFeeCount += 1;
-              weeklyData[wi].implFeeRevenue += (line.amount || 0) / 100;
-            }
-          }
-        }
-      }
-      hasMore = data.has_more;
-      if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    }
-
-    // Add current month impl fees to MRR
-    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-    let monthImplFees = 0;
-    for (const wd of weeklyData) {
-      const ws = new Date(weeks[weeklyData.indexOf(wd)]?.start || 0);
-      if (ws >= monthStart) monthImplFees += wd.implFeeRevenue;
-    }
-
-    res.status(200).json({
-      currentMRR: Math.round(currentMRR + monthImplFees),
-      currentARR: Math.round((currentMRR + monthImplFees) * 12),
-      weeks: weeklyData
-    });
-  } catch (err) {
-    console.error('Stripe error:', err);
-    res.status(500).json({ error: 'Stripe API failed', details: err.message });
+  // Stripe
+  if (stripeResult.status === 'fulfilled') {
+    response.stripe = stripeResult.value;
+  } else {
+    errors.push('Stripe: ' + stripeResult.reason.message);
+    response.stripe = { currentMRR: 0, currentARR: 0, weeks: weeks.map(w => ({ weekOf: w.label })) };
   }
+
+  // HubSpot
+  if (hubspotResult.status === 'fulfilled') {
+    response.hubspot = hubspotResult.value;
+  } else {
+    errors.push('HubSpot: ' + hubspotResult.reason.message);
+    response.hubspot = { weeks: weeks.map(w => ({ weekOf: w.label })) };
+  }
+
+  // Supabase
+  if (supabaseResult.status === 'fulfilled') {
+    response.supabase = supabaseResult.value;
+  } else {
+    errors.push('Supabase: ' + supabaseResult.reason.message);
+    response.supabase = { weeks: weeks.map(w => ({ weekOf: w.label })) };
+  }
+
+  if (errors.length > 0) response.errors = errors;
+
+  res.status(200).json(response);
 };
 
+// ============================================================
+// STRIPE
+// ============================================================
+async function fetchStripe(weeks, yearStart, now) {
+  const SK = process.env.STRIPE_SECRET_KEY;
+  if (!SK) throw new Error('STRIPE_SECRET_KEY not configured');
+
+  const headers = { 'Authorization': 'Bearer ' + SK };
+  const yearStartUnix = Math.floor(yearStart.getTime() / 1000);
+
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, newMRR: 0, churn: 0, upgrade: 0, downgrade: 0,
+    reactivation: 0, implFeeCount: 0, implFeeRevenue: 0,
+    cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
+  }));
+
+  // 1. Active subscriptions for current MRR
+  let currentMRR = 0;
+  let hasMore = true;
+  let startingAfter = '';
+
+  while (hasMore) {
+    const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+
+    for (const sub of data.data) {
+      currentMRR += calcMRR(sub);
+    }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+  }
+
+  // 2. Subscription events
+  const eventTypes = [
+    'customer.subscription.created',
+    'customer.subscription.deleted',
+    'customer.subscription.updated'
+  ];
+
+  for (const eventType of eventTypes) {
+    hasMore = true;
+    startingAfter = '';
+    while (hasMore) {
+      const url = 'https://api.stripe.com/v1/events?type=' + eventType +
+        '&created[gte]=' + yearStartUnix + '&limit=100' +
+        (startingAfter ? '&starting_after=' + startingAfter : '');
+      const resp = await fetch(url, { headers });
+      const data = await resp.json();
+      if (data.error) throw new Error(data.error.message);
+
+      for (const event of data.data) {
+        const createdAt = new Date(event.created * 1000);
+        const wi = findWeekIndex(weeks, createdAt);
+        if (wi === -1) continue;
+        const sub = event.data.object;
+
+        if (event.type === 'customer.subscription.created') {
+          weeklyData[wi].newSubs += 1;
+          weeklyData[wi].newMRR += calcMRR(sub);
+        } else if (event.type === 'customer.subscription.deleted') {
+          weeklyData[wi].cancellations += 1;
+          weeklyData[wi].churn -= calcMRR(sub);
+        } else if (event.type === 'customer.subscription.updated') {
+          const prev = event.data.previous_attributes;
+          if (prev && prev.status === 'canceled' && sub.status === 'active') {
+            weeklyData[wi].reactivations += 1;
+            weeklyData[wi].reactivation += calcMRR(sub);
+          } else if (prev && (prev.items || prev.plan)) {
+            const newMrr = calcMRR(sub);
+            const diff = newMrr - calcMRR(sub);
+            if (diff > 0) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
+            else if (diff < 0) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += diff; }
+          }
+        }
+      }
+      hasMore = data.has_more;
+      if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    }
+  }
+
+  // 3. Invoices for implementation fees
+  const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
+  hasMore = true;
+  startingAfter = '';
+
+  while (hasMore) {
+    const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
+      '&limit=100&expand[]=data.lines' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error.message);
+
+    for (const inv of data.data) {
+      const createdAt = new Date(inv.created * 1000);
+      const wi = findWeekIndex(weeks, createdAt);
+      if (wi === -1) continue;
+
+      if (inv.lines && inv.lines.data) {
+        for (const line of inv.lines.data) {
+          const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
+          if (productId === IMPL_PRODUCT) {
+            weeklyData[wi].implFeeCount += 1;
+            weeklyData[wi].implFeeRevenue += (line.amount || 0) / 100;
+          }
+        }
+      }
+    }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+  }
+
+  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+  let monthImplFees = 0;
+  for (let i = 0; i < weeklyData.length; i++) {
+    const ws = new Date(weeks[i]?.start || 0);
+    if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
+  }
+
+  return {
+    currentMRR: Math.round(currentMRR + monthImplFees),
+    currentARR: Math.round((currentMRR + monthImplFees) * 12),
+    weeks: weeklyData
+  };
+}
+
+// ============================================================
+// HUBSPOT
+// ============================================================
+async function fetchHubSpot(weeks, yearStart) {
+  const TOKEN = process.env.HUBSPOT_ACCESS_TOKEN;
+  if (!TOKEN) throw new Error('HUBSPOT_ACCESS_TOKEN not configured');
+
+  const headers = {
+    'Authorization': 'Bearer ' + TOKEN,
+    'Content-Type': 'application/json'
+  };
+
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, demos: 0, infoSessions: 0, demosSpecific: 0, totalDemos: 0, dealsCreated: 0
+  }));
+
+  // 1. Meetings
+  let after = undefined;
+  let hasMore = true;
+
+  while (hasMore) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'hs_timestamp', operator: 'GTE', value: yearStart.getTime().toString() },
+          { propertyName: 'hs_meeting_outcome', operator: 'HAS_PROPERTY' }
+        ]
+      }],
+      properties: ['hs_meeting_title', 'hs_timestamp', 'hs_meeting_outcome'],
+      sorts: [{ propertyName: 'hs_timestamp', direction: 'ASCENDING' }],
+      limit: 100
+    };
+    if (after) body.after = after;
+
+    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/meetings/search', {
+      method: 'POST', headers, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.status === 'error') throw new Error(data.message || 'HubSpot meetings search failed');
+
+    const meetings = data.results || [];
+    for (const meeting of meetings) {
+      const ts = new Date(meeting.properties.hs_timestamp);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi === -1) continue;
+
+      const title = (meeting.properties.hs_meeting_title || '').toLowerCase();
+      weeklyData[wi].infoSessions += 1;
+      weeklyData[wi].totalDemos += 1;
+      if (title.includes('demo')) weeklyData[wi].demosSpecific += 1;
+    }
+
+    after = data.paging && data.paging.next && data.paging.next.after;
+    hasMore = !!after;
+  }
+
+  // 2. Deals
+  after = undefined;
+  hasMore = true;
+
+  while (hasMore) {
+    const body = {
+      filterGroups: [{
+        filters: [
+          { propertyName: 'createdate', operator: 'GTE', value: yearStart.getTime().toString() }
+        ]
+      }],
+      properties: ['createdate', 'dealname', 'amount', 'dealstage'],
+      sorts: [{ propertyName: 'createdate', direction: 'ASCENDING' }],
+      limit: 100
+    };
+    if (after) body.after = after;
+
+    const resp = await fetch('https://api.hubapi.com/crm/v3/objects/deals/search', {
+      method: 'POST', headers, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    if (data.status === 'error') throw new Error(data.message || 'HubSpot deals search failed');
+
+    const deals = data.results || [];
+    for (const deal of deals) {
+      const ts = new Date(deal.properties.createdate);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].dealsCreated += 1;
+    }
+
+    after = data.paging && data.paging.next && data.paging.next.after;
+    hasMore = !!after;
+  }
+
+  return { weeks: weeklyData };
+}
+
+// ============================================================
+// SUPABASE
+// ============================================================
+async function fetchSupabase(weeks, yearStart) {
+  const SUPA_URL = process.env.SUPABASE_URL;
+  const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!SUPA_URL || !SUPA_KEY) throw new Error('Supabase env vars not configured');
+
+  const headers = {
+    'apikey': SUPA_KEY,
+    'Authorization': 'Bearer ' + SUPA_KEY,
+    'Content-Type': 'application/json',
+    'Prefer': 'return=representation'
+  };
+
+  const weeklyData = weeks.map(w => ({
+    weekOf: w.label, searches: 0, newEstates: 0, newSubs: 0
+  }));
+
+  // 1. Searches
+  let allTasks = [];
+  let offset = 0;
+  const batchSize = 1000;
+  let keepGoing = true;
+
+  while (keepGoing) {
+    const url = SUPA_URL + '/rest/v1/estate_task?select=id,createdAt,label,estateId' +
+      '&createdAt=gte.' + yearStart.toISOString() +
+      '&label=ilike.*search*' +
+      '&order=createdAt.asc' +
+      '&offset=' + offset + '&limit=' + batchSize;
+
+    const resp = await fetch(url, { headers });
+    if (!resp.ok) { console.error('Supabase estate_task error:', resp.status); break; }
+    const data = await resp.json();
+    if (!data || data.length === 0) { keepGoing = false; break; }
+    allTasks = allTasks.concat(data);
+    offset += batchSize;
+    if (data.length < batchSize) keepGoing = false;
+  }
+
+  // Exclude Mendelsohn estates
+  const exclUrl = SUPA_URL + '/rest/v1/estate?select=id&portalId=eq.' + MENDELSOHN_PORTAL_ID;
+  const exclResp = await fetch(exclUrl, { headers });
+  const exclData = exclResp.ok ? await exclResp.json() : [];
+  const excludedIds = new Set(exclData.map(e => e.id));
+
+  for (const task of allTasks) {
+    if (excludedIds.has(task.estateId)) continue;
+    const ts = new Date(task.createdAt);
+    const wi = findWeekIndex(weeks, ts);
+    if (wi !== -1) weeklyData[wi].searches += 1;
+  }
+
+  // 2. New estates
+  const estateUrl = SUPA_URL + '/rest/v1/estate?select=id,createdAt,portalId' +
+    '&createdAt=gte.' + yearStart.toISOString() +
+    '&portalId=neq.' + MENDELSOHN_PORTAL_ID +
+    '&order=createdAt.asc&limit=10000';
+
+  const estateResp = await fetch(estateUrl, { headers });
+  if (estateResp.ok) {
+    const estates = await estateResp.json();
+    for (const estate of estates) {
+      const ts = new Date(estate.createdAt);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].newEstates += 1;
+    }
+  }
+
+  // 3. New subscriptions
+  const subUrl = SUPA_URL + '/rest/v1/feature_subscription?select=id,createdAt' +
+    '&createdAt=gte.' + yearStart.toISOString() +
+    '&order=createdAt.asc&limit=10000';
+
+  const subResp = await fetch(subUrl, { headers });
+  if (subResp.ok) {
+    const subs = await subResp.json();
+    for (const sub of subs) {
+      const ts = new Date(sub.createdAt);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].newSubs += 1;
+    }
+  }
+
+  return { weeks: weeklyData };
+}
+
+// ============================================================
+// SHARED HELPERS
+// ============================================================
 function calcMRR(sub) {
   let mrr = 0;
   if (sub.items && sub.items.data) {
