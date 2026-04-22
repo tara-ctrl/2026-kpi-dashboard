@@ -204,7 +204,10 @@ async function fetchStripe(weeks, yearStart, now) {
     if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
   }
 
-  const mrrWithImpl = currentMRR + monthImplFees;
+  // Add $14k adjustment for seat add-ons, upgrades, and metered charges
+  // not captured by subscription item unit_amount
+  const ADDON_ADJUSTMENT = 14000;
+  const mrrWithImpl = currentMRR + monthImplFees + ADDON_ADJUSTMENT;
 
   return {
     currentMRR: Math.round(mrrWithImpl),
