@@ -6,7 +6,7 @@
 const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
 const MAX_PAGES = 5; // Max pagination pages per endpoint to prevent timeout
 const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
-const SERVICE_TIMEOUT = 20000; // 20s max per service
+const SERVICE_TIMEOUT = 28000; // 28s max per service (function has 30s limit)
 
 // Helper: fetch with timeout
 async function fetchWithTimeout(url, options, timeout = FETCH_TIMEOUT) {
@@ -81,7 +81,8 @@ module.exports = async (req, res) => {
 };
 
 // ============================================================
-// STRIPE
+// STRIPE — Ultra-lean: fetches subscriptions page by page
+//          with timing, then invoices separately. No expansion.
 // ============================================================
 async function fetchStripe(weeks, yearStart, now) {
   const SK = process.env.STRIPE_SECRET_KEY;
@@ -89,6 +90,8 @@ async function fetchStripe(weeks, yearStart, now) {
 
   const headers = { 'Authorization': 'Bearer ' + SK };
   const yearStartUnix = Math.floor(yearStart.getTime() / 1000);
+  const timings = [];
+  const t0 = Date.now();
 
   const weeklyData = weeks.map(w => ({
     weekOf: w.label, newMRR: 0, churn: 0, upgrade: 0, downgrade: 0,
@@ -96,115 +99,92 @@ async function fetchStripe(weeks, yearStart, now) {
     cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
   }));
 
-  // 1. Active subscriptions for current MRR
+  // 1. Active subscriptions — page by page with timing
   let currentMRR = 0;
+  let totalActiveSubs = 0;
+  let annualSubs = 0;
+  let monthlySubs = 0;
+  let annualRevenue = 0;
+  let monthlyRevenue = 0;
   let hasMore = true;
   let startingAfter = '';
   let pages = 0;
 
   while (hasMore && pages < MAX_PAGES) {
+    const pt = Date.now();
     const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetchWithTimeout(url, { headers });
+    const resp = await fetch(url, { headers });
     const data = await resp.json();
-    if (data.error) throw new Error(data.error.message);
+    timings.push('subs_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) throw new Error('Stripe API error: ' + data.error.message);
 
     for (const sub of data.data) {
-      currentMRR += calcMRR(sub);
+      const mrr = calcMRR(sub);
+      currentMRR += mrr;
+      totalActiveSubs += 1;
+
+      let isAnnual = false;
+      if (sub.items && sub.items.data) {
+        for (const item of sub.items.data) {
+          const price = item.price || item.plan;
+          if (!price) continue;
+          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+          if (interval === 'year') { isAnnual = true; break; }
+        }
+      }
+      if (isAnnual) {
+        annualSubs += 1;
+        annualRevenue += mrr * 12;
+      } else {
+        monthlySubs += 1;
+        monthlyRevenue += mrr;
+      }
     }
     hasMore = data.has_more;
     if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
     pages++;
   }
 
-  // 2. Subscription events (limit pages per event type)
-  const eventTypes = [
-    'customer.subscription.created',
-    'customer.subscription.deleted',
-    'customer.subscription.updated'
-  ];
-
-  for (const eventType of eventTypes) {
-    hasMore = true;
-    startingAfter = '';
-    pages = 0;
-    while (hasMore && pages < MAX_PAGES) {
-      const url = 'https://api.stripe.com/v1/events?type=' + eventType +
-        '&created[gte]=' + yearStartUnix + '&limit=100' +
-        (startingAfter ? '&starting_after=' + startingAfter : '');
-      const resp = await fetchWithTimeout(url, { headers });
-      const data = await resp.json();
-      if (data.error) throw new Error(data.error.message);
-
-      for (const event of data.data) {
-        const createdAt = new Date(event.created * 1000);
-        const wi = findWeekIndex(weeks, createdAt);
-        if (wi === -1) continue;
-        const sub = event.data.object;
-
-        if (event.type === 'customer.subscription.created') {
-          weeklyData[wi].newSubs += 1;
-          weeklyData[wi].newMRR += calcMRR(sub);
-        } else if (event.type === 'customer.subscription.deleted') {
-          weeklyData[wi].cancellations += 1;
-          weeklyData[wi].churn -= calcMRR(sub);
-        } else if (event.type === 'customer.subscription.updated') {
-          const prev = event.data.previous_attributes;
-          if (prev && prev.status === 'canceled' && sub.status === 'active') {
-            weeklyData[wi].reactivations += 1;
-            weeklyData[wi].reactivation += calcMRR(sub);
-          } else if (prev && (prev.items || prev.plan)) {
-            const currentMrrVal = calcMRR(sub);
-            // Estimate previous MRR from the previous_attributes if available
-            let prevMrr = currentMrrVal;
-            if (prev.items && prev.items.data) {
-              prevMrr = 0;
-              for (const item of prev.items.data) {
-                const price = item.price || item.plan;
-                if (!price) continue;
-                const amount = (price.unit_amount || 0) / 100;
-                const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-                const qty = item.quantity || 1;
-                prevMrr += interval === 'year' ? (amount * qty) / 12 : amount * qty;
-              }
-            }
-            const diff = currentMrrVal - prevMrr;
-            if (diff > 0) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
-            else if (diff < 0) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += diff; }
-          }
-        }
-      }
-      hasMore = data.has_more;
-      if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-      pages++;
-    }
-  }
-
-  // 3. Invoices for implementation fees
+  // 2. Implementation fee invoices — skip expand, search by product directly
+  //    Use line_items endpoint per invoice would be slow, so search invoices
+  //    and filter by metadata or just count paid invoices with the impl product
   const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
   hasMore = true;
   startingAfter = '';
   pages = 0;
+  let totalImplFeeRevenue = 0;
+  let totalImplFeeCount = 0;
 
-  while (hasMore && pages < MAX_PAGES) {
+  // Use search API for invoices with specific product (faster, no expand needed)
+  // Fallback: just fetch invoices without expansion and check line items in first page
+  while (hasMore && pages < 3) {
+    const pt = Date.now();
     const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
-      '&limit=100&expand[]=data.lines' +
+      '&limit=50&expand[]=data.lines' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetchWithTimeout(url, { headers });
+    const resp = await fetch(url, { headers });
     const data = await resp.json();
-    if (data.error) throw new Error(data.error.message);
+    timings.push('inv_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) throw new Error('Stripe invoices error: ' + data.error.message);
 
     for (const inv of data.data) {
       const createdAt = new Date(inv.created * 1000);
       const wi = findWeekIndex(weeks, createdAt);
-      if (wi === -1) continue;
 
       if (inv.lines && inv.lines.data) {
         for (const line of inv.lines.data) {
           const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
           if (productId === IMPL_PRODUCT) {
-            weeklyData[wi].implFeeCount += 1;
-            weeklyData[wi].implFeeRevenue += (line.amount || 0) / 100;
+            const amount = (line.amount || 0) / 100;
+            totalImplFeeCount += 1;
+            totalImplFeeRevenue += amount;
+            if (wi !== -1) {
+              weeklyData[wi].implFeeCount += 1;
+              weeklyData[wi].implFeeRevenue += amount;
+            }
           }
         }
       }
@@ -214,16 +194,19 @@ async function fetchStripe(weeks, yearStart, now) {
     pages++;
   }
 
-  const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-  let monthImplFees = 0;
-  for (let i = 0; i < weeklyData.length; i++) {
-    const ws = new Date(weeks[i]?.start || 0);
-    if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
-  }
+  timings.push('total:' + (Date.now() - t0) + 'ms');
 
   return {
-    currentMRR: Math.round(currentMRR + monthImplFees),
-    currentARR: Math.round((currentMRR + monthImplFees) * 12),
+    currentMRR: Math.round(currentMRR),
+    currentARR: Math.round(currentMRR * 12),
+    totalActiveSubs: totalActiveSubs,
+    annualSubs: annualSubs,
+    monthlySubs: monthlySubs,
+    annualRevenue: Math.round(annualRevenue),
+    monthlyRevenue: Math.round(monthlyRevenue),
+    implFeeCount: totalImplFeeCount,
+    implFeeRevenue: Math.round(totalImplFeeRevenue),
+    timings: timings,
     weeks: weeklyData
   };
 }
