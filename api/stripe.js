@@ -3,7 +3,29 @@
 // Returns combined data from all three sources in one response
 // Optimized with timeouts and pagination limits to avoid serverless timeout
 
-const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
+// Excluded test/fake portal IDs
+const EXCLUDED_PORTALS = [
+  '370b66bd-a47f-4ff8-8b0a-a5d439e15e57',
+  '51e52be2-5999-4641-b256-0bdbcf60d391',
+  'fe2fc1c3-f3c8-4306-a02e-b61e05d82d60',
+  '57292abe-a999-4d31-8491-720da8a45326',
+  '101e5b08-829e-49fe-bbc4-5b7d0cf71904',
+  '07da4649-5a65-4303-b783-b7c520af73f7',
+  '5a2ae4c4-8bcd-4928-98c2-282e10179321',
+  'd1a5a666-1b65-4d39-bca8-4731ad966437',
+  '6184f97a-176c-4019-81b2-40d05db4c5c9',
+  '67beba74-c190-4311-9c75-bb40d8206613',
+  'd37cb6ba-f184-452c-ba9d-b0cf43acf0cc',
+  '4ab7223e-bcf5-4723-80b2-31127346b893',
+  'f78d6778-a15d-4a25-8f3b-193c70f44940',
+  '9fd0b24a-11f7-43e1-9d68-00022d9b8821',
+  '0e6ca2a1-7e1e-4d42-a0f7-401ed3ede75d',
+  'daa9515a-6896-4efe-a497-e4e8e05737ef',
+  'ec639e9b-05c4-4049-8e8d-6f49e02a6380',
+  '7477d99a-cee7-40b4-9557-02a09f61ea14',
+  '1f25b2d3-56fc-4835-8eb7-074367c06a25',
+  'cd2cfafa-4d53-457f-94bf-19fa164abd34'
+];
 const MAX_PAGES = 8; // Max pagination pages per endpoint (800 subs capacity)
 const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
 const SERVICE_TIMEOUT = 28000; // 28s max per service (function has 30s limit)
@@ -418,47 +440,40 @@ async function fetchSupabase(weeks, yearStart) {
     weekOf: w.label, searches: 0, newEstates: 0, newSubs: 0
   }));
 
-  // 1. Searches (limit to 5000 max)
-  let allTasks = [];
+  // 1. Searches — from quick_search_result table, excluding test portals
+  const excludedFilter = 'not.in.(' + EXCLUDED_PORTALS.join(',') + ')';
   let offset = 0;
   const batchSize = 1000;
   let keepGoing = true;
   let pages = 0;
 
-  while (keepGoing && pages < 5) {
-    const url = SUPA_URL + '/rest/v1/estate_task?select=id,createdAt,label,estateId' +
+  while (keepGoing && pages < 10) {
+    const url = SUPA_URL + '/rest/v1/quick_search_result?select=id,createdAt,portalId' +
       '&createdAt=gte.' + yearStart.toISOString() +
-      '&label=ilike.*search*' +
+      '&portalId=' + excludedFilter +
       '&order=createdAt.asc' +
       '&offset=' + offset + '&limit=' + batchSize;
 
     const resp = await fetchWithTimeout(url, { headers });
-    if (!resp.ok) { console.error('Supabase estate_task error:', resp.status); break; }
+    if (!resp.ok) { console.error('Supabase quick_search_result error:', resp.status); break; }
     const data = await resp.json();
     if (!data || data.length === 0) { keepGoing = false; break; }
-    allTasks = allTasks.concat(data);
+
+    for (const row of data) {
+      const ts = new Date(row.createdAt);
+      const wi = findWeekIndex(weeks, ts);
+      if (wi !== -1) weeklyData[wi].searches += 1;
+    }
+
     offset += batchSize;
     if (data.length < batchSize) keepGoing = false;
     pages++;
   }
 
-  // Exclude Mendelsohn estates
-  const exclUrl = SUPA_URL + '/rest/v1/estate?select=id&portalId=eq.' + MENDELSOHN_PORTAL_ID;
-  const exclResp = await fetchWithTimeout(exclUrl, { headers });
-  const exclData = exclResp.ok ? await exclResp.json() : [];
-  const excludedIds = new Set(exclData.map(e => e.id));
-
-  for (const task of allTasks) {
-    if (excludedIds.has(task.estateId)) continue;
-    const ts = new Date(task.createdAt);
-    const wi = findWeekIndex(weeks, ts);
-    if (wi !== -1) weeklyData[wi].searches += 1;
-  }
-
-  // 2. New estates
+  // 2. New estates (excluding test portals)
   const estateUrl = SUPA_URL + '/rest/v1/estate?select=id,createdAt,portalId' +
     '&createdAt=gte.' + yearStart.toISOString() +
-    '&portalId=neq.' + MENDELSOHN_PORTAL_ID +
+    '&portalId=' + excludedFilter +
     '&order=createdAt.asc&limit=10000';
 
   const estateResp = await fetchWithTimeout(estateUrl, { headers });
