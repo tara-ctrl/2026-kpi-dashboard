@@ -4,7 +4,7 @@
 // Optimized with timeouts and pagination limits to avoid serverless timeout
 
 const MENDELSOHN_PORTAL_ID = '370b66bd-a47f-4ff8-8b0a-a5d439e15e57';
-const MAX_PAGES = 5; // Max pagination pages per endpoint to prevent timeout
+const MAX_PAGES = 8; // Max pagination pages per endpoint (800 subs capacity)
 const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
 const SERVICE_TIMEOUT = 28000; // 28s max per service (function has 30s limit)
 
