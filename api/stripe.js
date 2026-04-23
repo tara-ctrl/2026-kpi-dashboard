@@ -121,6 +121,10 @@ async function fetchStripe(weeks, yearStart, now) {
     cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
   }));
 
+  // Track customer IDs across active & canceled subs for reactivation detection
+  const activeCustomerYTD = new Map(); // customerId -> { sub, mrr, created }
+  const canceledCustomers = new Set();
+
   // 1. Active subscriptions — page by page with timing
   let currentMRR = 0;
   let totalActiveSubs = 0;
@@ -171,6 +175,8 @@ async function fetchStripe(weeks, yearStart, now) {
           weeklyData[wi].newSubs += 1;
           weeklyData[wi].newMRR += mrr;
         }
+        // Track for reactivation detection
+        activeCustomerYTD.set(sub.customer, { mrr, created: subCreated, wi });
       }
 
       let isAnnual = false;
@@ -265,6 +271,8 @@ async function fetchStripe(weeks, yearStart, now) {
     let foundOlder = false;
     for (const sub of data.data) {
       const canceledAt = sub.canceled_at || 0;
+      // Always track customer for reactivation detection, even if older than current month
+      canceledCustomers.add(sub.customer);
       if (canceledAt < currentMonthUnix) { foundOlder = true; continue; }
 
       const lostMRR = calcMRR(sub);
@@ -303,6 +311,7 @@ async function fetchStripe(weeks, yearStart, now) {
 
   // 4. Upgrades & Downgrades — via subscription update events where price changed
   //    Uses Stripe Events API: customer.subscription.updated with previous_attributes
+  //    Limited to 1 page (100 events) to stay within timeout budget
   hasMore = true;
   startingAfter = '';
   pages = 0;
@@ -311,7 +320,7 @@ async function fetchStripe(weeks, yearStart, now) {
   let upgradeMRR = 0;
   let downgradeMRR = 0;
 
-  while (hasMore && pages < 3) {
+  while (hasMore && pages < 2) {
     const pt = Date.now();
     const url = 'https://api.stripe.com/v1/events?type=customer.subscription.updated' +
       '&created[gte]=' + yearStartUnix + '&limit=100' +
@@ -327,12 +336,9 @@ async function fetchStripe(weeks, yearStart, now) {
       const prev = event.data && event.data.previous_attributes;
       if (!sub || !prev) continue;
 
-      // Detect plan/price change by checking if items changed
-      // Compare previous plan amount to current plan amount
       let prevMRR = 0;
       let currMRR = 0;
 
-      // Current MRR from the subscription object
       if (sub.items && sub.items.data) {
         for (const item of sub.items.data) {
           const price = item.price || item.plan;
@@ -344,7 +350,6 @@ async function fetchStripe(weeks, yearStart, now) {
         }
       }
 
-      // Previous MRR from previous_attributes.items
       if (prev.items && prev.items.data) {
         for (const item of prev.items.data) {
           const price = item.price || item.plan;
@@ -355,16 +360,13 @@ async function fetchStripe(weeks, yearStart, now) {
           prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
         }
       } else if (prev.plan) {
-        // Simpler case: single-plan subscription changed plans
         const amount = (prev.plan.amount || 0) / 100;
         const interval = prev.plan.interval || 'month';
         prevMRR = interval === 'year' ? amount / 12 : amount;
       } else {
-        // No previous items/plan info — skip (not a plan change event)
         continue;
       }
 
-      // Only count if there's a meaningful MRR difference (> $1 to avoid noise)
       const diff = currMRR - prevMRR;
       if (Math.abs(diff) < 1) continue;
 
@@ -393,71 +395,20 @@ async function fetchStripe(weeks, yearStart, now) {
     pages++;
   }
 
-  // 5. Reactivations — active subs where customer also has a canceled sub
-  //    (customer came back after canceling). Check active subs created YTD.
-  hasMore = true;
-  startingAfter = '';
-  pages = 0;
+  // 5. Reactivations — no extra API calls needed!
+  //    Cross-reference activeCustomerYTD (from step 1) with canceledCustomers (from step 3)
   let totalReactivations = 0;
   let reactivationMRR = 0;
 
-  // Build set of customer IDs with canceled subs (already fetched in step 3,
-  // but we only fetched current-month cancels). Fetch a broader set.
-  const canceledCustomers = new Set();
-
-  // Quick scan: fetch canceled subs to build customer ID set
-  let cmHasMore = true;
-  let cmStartingAfter = '';
-  let cmPages = 0;
-  while (cmHasMore && cmPages < 3) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/subscriptions?status=canceled&limit=100' +
-      (cmStartingAfter ? '&starting_after=' + cmStartingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('react_scan_p' + (cmPages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
-
-    if (data.error) break;
-    for (const sub of data.data) {
-      canceledCustomers.add(sub.customer);
-    }
-    cmHasMore = data.has_more;
-    if (data.data.length > 0) cmStartingAfter = data.data[data.data.length - 1].id;
-    cmPages++;
-  }
-
-  // Now scan active subs created YTD: if customer is in canceledCustomers, it's a reactivation
-  // We already have active subs in memory from step 1, but we didn't store them.
-  // Use a second pass with created[gte] filter for efficiency.
-  hasMore = true;
-  startingAfter = '';
-  pages = 0;
-  while (hasMore && pages < 3) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/subscriptions?status=active&created[gte]=' + yearStartUnix +
-      '&limit=100' + (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('react_active_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
-
-    if (data.error) break;
-    for (const sub of data.data) {
-      if (canceledCustomers.has(sub.customer)) {
-        totalReactivations += 1;
-        const mrr = calcMRR(sub);
-        reactivationMRR += mrr;
-
-        const subCreated = new Date(sub.created * 1000);
-        const wi = findWeekIndex(weeks, subCreated);
-        if (wi !== -1) {
-          weeklyData[wi].reactivations += 1;
-          weeklyData[wi].reactivation += mrr;
-        }
+  for (const [custId, info] of activeCustomerYTD) {
+    if (canceledCustomers.has(custId)) {
+      totalReactivations += 1;
+      reactivationMRR += info.mrr;
+      if (info.wi !== -1) {
+        weeklyData[info.wi].reactivations += 1;
+        weeklyData[info.wi].reactivation += info.mrr;
       }
     }
-    hasMore = data.has_more;
-    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    pages++;
   }
 
   timings.push('total:' + (Date.now() - t0) + 'ms');
