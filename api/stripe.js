@@ -164,6 +164,15 @@ async function fetchStripe(weeks, yearStart, now) {
         newRevenuePriorMonth += calcBillingAmount(sub);
       }
 
+      // Bucket into weekly chart data (new subs per week, YTD)
+      if (subCreated >= yearStart) {
+        const wi = findWeekIndex(weeks, subCreated);
+        if (wi !== -1) {
+          weeklyData[wi].newSubs += 1;
+          weeklyData[wi].newMRR += mrr;
+        }
+      }
+
       let isAnnual = false;
       if (sub.items && sub.items.data) {
         for (const item of sub.items.data) {
@@ -268,6 +277,18 @@ async function fetchStripe(weeks, yearStart, now) {
         cancelVoluntary += 1;
       } else {
         cancelOther += 1;
+      }
+
+      // Bucket cancellation into weekly chart data
+      const cancelDate = new Date(canceledAt * 1000);
+      const cwi = findWeekIndex(weeks, cancelDate);
+      if (cwi !== -1) weeklyData[cwi].cancellations += 1;
+
+      // Also count this as a new sub in the week it was created (if YTD)
+      const cancelSubCreated = new Date(sub.created * 1000);
+      if (cancelSubCreated >= yearStart) {
+        const swi = findWeekIndex(weeks, cancelSubCreated);
+        if (swi !== -1) weeklyData[swi].newSubs += 1;
       }
     }
 
