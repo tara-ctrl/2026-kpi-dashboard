@@ -301,6 +301,165 @@ async function fetchStripe(weeks, yearStart, now) {
     if (foundOlder) break;
   }
 
+  // 4. Upgrades & Downgrades — via subscription update events where price changed
+  //    Uses Stripe Events API: customer.subscription.updated with previous_attributes
+  hasMore = true;
+  startingAfter = '';
+  pages = 0;
+  let totalUpgrades = 0;
+  let totalDowngrades = 0;
+  let upgradeMRR = 0;
+  let downgradeMRR = 0;
+
+  while (hasMore && pages < 3) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/events?type=customer.subscription.updated' +
+      '&created[gte]=' + yearStartUnix + '&limit=100' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('events_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) { console.error('Stripe events error:', data.error.message); break; }
+
+    for (const event of data.data) {
+      const sub = event.data && event.data.object;
+      const prev = event.data && event.data.previous_attributes;
+      if (!sub || !prev) continue;
+
+      // Detect plan/price change by checking if items changed
+      // Compare previous plan amount to current plan amount
+      let prevMRR = 0;
+      let currMRR = 0;
+
+      // Current MRR from the subscription object
+      if (sub.items && sub.items.data) {
+        for (const item of sub.items.data) {
+          const price = item.price || item.plan;
+          if (!price) continue;
+          const amount = (price.unit_amount || 0) / 100;
+          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+          const qty = item.quantity || 1;
+          currMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
+        }
+      }
+
+      // Previous MRR from previous_attributes.items
+      if (prev.items && prev.items.data) {
+        for (const item of prev.items.data) {
+          const price = item.price || item.plan;
+          if (!price) continue;
+          const amount = (price.unit_amount || 0) / 100;
+          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+          const qty = item.quantity || 1;
+          prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
+        }
+      } else if (prev.plan) {
+        // Simpler case: single-plan subscription changed plans
+        const amount = (prev.plan.amount || 0) / 100;
+        const interval = prev.plan.interval || 'month';
+        prevMRR = interval === 'year' ? amount / 12 : amount;
+      } else {
+        // No previous items/plan info — skip (not a plan change event)
+        continue;
+      }
+
+      // Only count if there's a meaningful MRR difference (> $1 to avoid noise)
+      const diff = currMRR - prevMRR;
+      if (Math.abs(diff) < 1) continue;
+
+      const eventDate = new Date(event.created * 1000);
+      const wi = findWeekIndex(weeks, eventDate);
+
+      if (diff > 0) {
+        totalUpgrades += 1;
+        upgradeMRR += diff;
+        if (wi !== -1) {
+          weeklyData[wi].upgrades += 1;
+          weeklyData[wi].upgrade += diff;
+        }
+      } else {
+        totalDowngrades += 1;
+        downgradeMRR += Math.abs(diff);
+        if (wi !== -1) {
+          weeklyData[wi].downgrades += 1;
+          weeklyData[wi].downgrade += Math.abs(diff);
+        }
+      }
+    }
+
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
+  }
+
+  // 5. Reactivations — active subs where customer also has a canceled sub
+  //    (customer came back after canceling). Check active subs created YTD.
+  hasMore = true;
+  startingAfter = '';
+  pages = 0;
+  let totalReactivations = 0;
+  let reactivationMRR = 0;
+
+  // Build set of customer IDs with canceled subs (already fetched in step 3,
+  // but we only fetched current-month cancels). Fetch a broader set.
+  const canceledCustomers = new Set();
+
+  // Quick scan: fetch canceled subs to build customer ID set
+  let cmHasMore = true;
+  let cmStartingAfter = '';
+  let cmPages = 0;
+  while (cmHasMore && cmPages < 3) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/subscriptions?status=canceled&limit=100' +
+      (cmStartingAfter ? '&starting_after=' + cmStartingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('react_scan_p' + (cmPages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) break;
+    for (const sub of data.data) {
+      canceledCustomers.add(sub.customer);
+    }
+    cmHasMore = data.has_more;
+    if (data.data.length > 0) cmStartingAfter = data.data[data.data.length - 1].id;
+    cmPages++;
+  }
+
+  // Now scan active subs created YTD: if customer is in canceledCustomers, it's a reactivation
+  // We already have active subs in memory from step 1, but we didn't store them.
+  // Use a second pass with created[gte] filter for efficiency.
+  hasMore = true;
+  startingAfter = '';
+  pages = 0;
+  while (hasMore && pages < 3) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/subscriptions?status=active&created[gte]=' + yearStartUnix +
+      '&limit=100' + (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('react_active_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+
+    if (data.error) break;
+    for (const sub of data.data) {
+      if (canceledCustomers.has(sub.customer)) {
+        totalReactivations += 1;
+        const mrr = calcMRR(sub);
+        reactivationMRR += mrr;
+
+        const subCreated = new Date(sub.created * 1000);
+        const wi = findWeekIndex(weeks, subCreated);
+        if (wi !== -1) {
+          weeklyData[wi].reactivations += 1;
+          weeklyData[wi].reactivation += mrr;
+        }
+      }
+    }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
+  }
+
   timings.push('total:' + (Date.now() - t0) + 'ms');
 
   // Roll current month's impl fee revenue into MRR
@@ -338,6 +497,12 @@ async function fetchStripe(weeks, yearStart, now) {
     cancelFailedPayment: cancelFailedPayment,
     cancelOther: cancelOther,
     cancelMRRLost: Math.round(cancelMRRLost),
+    totalUpgrades: totalUpgrades,
+    totalDowngrades: totalDowngrades,
+    upgradeMRR: Math.round(upgradeMRR),
+    downgradeMRR: Math.round(downgradeMRR),
+    totalReactivations: totalReactivations,
+    reactivationMRR: Math.round(reactivationMRR),
     implFeeCount: totalImplFeeCount,
     implFeeRevenue: Math.round(totalImplFeeRevenue),
     timings: timings,
@@ -491,20 +656,45 @@ async function fetchSupabase(weeks, yearStart) {
     pages++;
   }
 
-  // 2. New estates (excluding test portals)
-  const estateUrl = SUPA_URL + '/rest/v1/estate?select=id,createdAt,portalId' +
-    '&createdAt=gte.' + yearStart.toISOString() +
-    '&portalId=' + excludedFilter +
-    '&order=createdAt.asc&limit=10000';
+  // 2. New estates/matters (excluding test portals) — paginated
+  //    Estate types: TRUPLANNING, TRUADMIN, TRUSTADMIN, TRUPROXY
+  //    Column is "type" on the estate table
+  offset = 0;
+  keepGoing = true;
+  pages = 0;
+  let totalEstates = 0;
+  let estatesByType = { TRUPLANNING: 0, TRUADMIN: 0, TRUSTADMIN: 0, TRUPROXY: 0, OTHER: 0 };
 
-  const estateResp = await fetchWithTimeout(estateUrl, { headers });
-  if (estateResp.ok) {
+  while (keepGoing && pages < 15) {
+    const estateUrl = SUPA_URL + '/rest/v1/estate?select=id,createdAt,portalId,type' +
+      '&createdAt=gte.' + yearStart.toISOString() +
+      '&portalId=' + excludedFilter +
+      '&order=createdAt.asc' +
+      '&offset=' + offset + '&limit=' + batchSize;
+
+    const estateResp = await fetchWithTimeout(estateUrl, { headers });
+    if (!estateResp.ok) { console.error('Supabase estate error:', estateResp.status); break; }
     const estates = await estateResp.json();
+    if (!estates || estates.length === 0) { keepGoing = false; break; }
+
     for (const estate of estates) {
       const ts = new Date(estate.createdAt);
       const wi = findWeekIndex(weeks, ts);
       if (wi !== -1) weeklyData[wi].newEstates += 1;
+      totalEstates += 1;
+
+      // Track by type
+      const etype = (estate.type || '').toUpperCase();
+      if (estatesByType.hasOwnProperty(etype)) {
+        estatesByType[etype] += 1;
+      } else {
+        estatesByType.OTHER += 1;
+      }
     }
+
+    offset += batchSize;
+    if (estates.length < batchSize) keepGoing = false;
+    pages++;
   }
 
   // 3. New subscriptions
@@ -522,7 +712,7 @@ async function fetchSupabase(weeks, yearStart) {
     }
   }
 
-  return { weeks: weeklyData };
+  return { totalEstates, estatesByType, weeks: weeklyData };
 }
 
 // ============================================================
