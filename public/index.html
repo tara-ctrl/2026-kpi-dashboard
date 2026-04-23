@@ -128,12 +128,6 @@
       <div class="chart-container"><canvas id="chartPlanBreakdown"></canvas></div>
     </div>
   </div>
-  <div class="chart-row">
-    <div class="chart-card full">
-      <div class="chart-title"><span class="dot" style="background:var(--amber)"></span> Implementation Fee Revenue per Week — Included in MRR (Stripe)</div>
-      <div class="chart-container"><canvas id="chartImplFee"></canvas></div>
-    </div>
-  </div>
 </div>
 
 <!-- Weekly Detail Table -->
@@ -418,36 +412,7 @@ async function loadDashboard() {
       }
     });
 
-    new Chart(document.getElementById("chartImplFee"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          {
-            label: "Impl. Fee Revenue ($)", data: implFeeRevenue,
-            backgroundColor: implFeeRevenue.map(function(v, i) { return i === lastIdx ? "#f59e0b" : "#f59e0b88"; }),
-            borderRadius: 4, barPercentage: 0.5, yAxisID: "y"
-          },
-          {
-            label: "# of Fees Collected", data: implFeeCount,
-            type: "line", borderColor: "#6366f1", backgroundColor: "#6366f122",
-            tension: 0.3, pointRadius: 4, pointBackgroundColor: "#6366f1", fill: false, yAxisID: "y1"
-          }
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: "top", labels: { boxWidth: 10, padding: 12 } },
-          tooltip: { callbacks: { label: function(ctx) { return ctx.dataset.label.includes("$") ? "$" + ctx.parsed.y.toLocaleString() : ctx.parsed.y + " fees"; } } }
-        },
-        scales: {
-          x: { grid: gridOpts },
-          y: { type: "linear", position: "left", beginAtZero: true, grid: gridOpts, ticks: { callback: function(v) { return "$" + (v/1000).toFixed(1) + "k"; } }, title: { display: true, text: "Revenue ($)", color: "#f59e0b" } },
-          y1: { type: "linear", position: "right", beginAtZero: true, grid: { drawOnChartArea: false }, title: { display: true, text: "Count", color: "#6366f1" } }
-        }
-      }
-    });
+    // Implementation Fee chart removed
 
     // ============================================================
     // WEEKLY TABLE
