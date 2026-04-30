@@ -121,92 +121,12 @@ async function fetchStripe(weeks, yearStart, now) {
     cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0, newSubs: 0
   }));
 
-  // Track customer IDs across active & canceled subs for reactivation detection
-  const activeCustomerYTD = new Map(); // customerId -> { sub, mrr, created }
-  const canceledCustomers = new Set();
-
-  // 1. Active subscriptions — page by page with timing
-  let currentMRR = 0;
-  let totalActiveSubs = 0;
-  let annualSubs = 0;
-  let monthlySubs = 0;
-  let annualRevenue = 0;
-  let monthlyRevenue = 0;
-  let newRevenueThisMonth = 0;
-  let newRevenuePriorMonth = 0;
-  let newMRRThisMonth = 0; // MRR from subs created this month (for MoM calc)
-  let hasMore = true;
-  let startingAfter = '';
-  let pages = 0;
-
-  // Date boundaries for current and prior month
   const currentMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const priorMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-
-  while (hasMore && pages < MAX_PAGES) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
-      (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('subs_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
-
-    if (data.error) throw new Error('Stripe API error: ' + data.error.message);
-
-    for (const sub of data.data) {
-      const mrr = calcMRR(sub);
-      currentMRR += mrr;
-      totalActiveSubs += 1;
-
-      // Track new revenue by month (actual billing amount, not MRR)
-      // This matches Stripe's "subscription creation" payment amounts
-      const subCreated = new Date(sub.created * 1000);
-      if (subCreated >= currentMonthStart) {
-        newRevenueThisMonth += calcBillingAmount(sub);
-        newMRRThisMonth += mrr; // track MRR from new subs for MoM calculation
-      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
-        newRevenuePriorMonth += calcBillingAmount(sub);
-      }
-
-      // Bucket into weekly chart data (new subs per week, YTD)
-      if (subCreated >= yearStart) {
-        const wi = findWeekIndex(weeks, subCreated);
-        if (wi !== -1) {
-          weeklyData[wi].newSubs += 1;
-          weeklyData[wi].newMRR += mrr;
-        }
-        // Track for reactivation detection
-        activeCustomerYTD.set(sub.customer, { mrr, created: subCreated, wi });
-      }
-
-      let isAnnual = false;
-      if (sub.items && sub.items.data) {
-        for (const item of sub.items.data) {
-          const price = item.price || item.plan;
-          if (!price) continue;
-          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-          if (interval === 'year') { isAnnual = true; break; }
-        }
-      }
-      if (isAnnual) {
-        annualSubs += 1;
-        annualRevenue += mrr * 12;
-      } else {
-        monthlySubs += 1;
-        monthlyRevenue += mrr;
-      }
-    }
-    hasMore = data.has_more;
-    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    pages++;
-  }
-
-  // 2-4. Run invoices, cancellation events, and upgrade events IN PARALLEL
-  //       to cut wall-clock time dramatically
-  const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
   const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
+  const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
 
-  // Helper for paginated fetches
+  // Helper for paginated fetches — collects raw results
   async function paginatedFetch(urlBase, maxPages, label) {
     const results = [];
     let hasMore2 = true, sa = '', pg = 0;
@@ -225,24 +145,57 @@ async function fetchStripe(weeks, yearStart, now) {
     return results;
   }
 
-  const [invoices, cancelEvents, updateEvents] = await Promise.all([
-    paginatedFetch(
-      'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix + '&limit=100&expand[]=data.lines',
-      6, 'inv'
-    ),
-    paginatedFetch(
-      'https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100',
-      3, 'cancel_ev'
-    ),
-    paginatedFetch(
-      'https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100',
-      2, 'upd_ev'
-    )
+  // *** ALL API CALLS RUN IN PARALLEL ***
+  const [activeSubs, invoices, cancelEvents, updateEvents] = await Promise.all([
+    paginatedFetch('https://api.stripe.com/v1/subscriptions?status=active&limit=100', MAX_PAGES, 'subs'),
+    paginatedFetch('https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix + '&limit=100&expand[]=data.lines', 6, 'inv'),
+    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 3, 'cancel_ev'),
+    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 2, 'upd_ev')
   ]);
 
-  // Process invoices for impl fees
-  let totalImplFeeRevenue = 0;
-  let totalImplFeeCount = 0;
+  // ---- Process active subscriptions ----
+  let currentMRR = 0, totalActiveSubs = 0, annualSubs = 0, monthlySubs = 0;
+  let annualRevenue = 0, monthlyRevenue = 0;
+  let newRevenueThisMonth = 0, newRevenuePriorMonth = 0, newMRRThisMonth = 0;
+  const activeCustomerYTD = new Map();
+
+  for (const sub of activeSubs) {
+    const mrr = calcMRR(sub);
+    currentMRR += mrr;
+    totalActiveSubs += 1;
+
+    const subCreated = new Date(sub.created * 1000);
+    if (subCreated >= currentMonthStart) {
+      newRevenueThisMonth += calcBillingAmount(sub);
+      newMRRThisMonth += mrr;
+    } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+      newRevenuePriorMonth += calcBillingAmount(sub);
+    }
+
+    if (subCreated >= yearStart) {
+      const wi = findWeekIndex(weeks, subCreated);
+      if (wi !== -1) {
+        weeklyData[wi].newSubs += 1;
+        weeklyData[wi].newMRR += mrr;
+      }
+      activeCustomerYTD.set(sub.customer, { mrr, created: subCreated, wi });
+    }
+
+    let isAnnual = false;
+    if (sub.items && sub.items.data) {
+      for (const item of sub.items.data) {
+        const price = item.price || item.plan;
+        if (!price) continue;
+        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+        if (interval === 'year') { isAnnual = true; break; }
+      }
+    }
+    if (isAnnual) { annualSubs += 1; annualRevenue += mrr * 12; }
+    else { monthlySubs += 1; monthlyRevenue += mrr; }
+  }
+
+  // ---- Process invoices for impl fees ----
+  let totalImplFeeRevenue = 0, totalImplFeeCount = 0;
   for (const inv of invoices) {
     const createdAt = new Date(inv.created * 1000);
     const wi = findWeekIndex(weeks, createdAt);
@@ -262,11 +215,9 @@ async function fetchStripe(weeks, yearStart, now) {
     }
   }
 
-  // Process cancellation events
-  let cancelVoluntary = 0;
-  let cancelFailedPayment = 0;
-  let cancelOther = 0;
-  let cancelMRRLost = 0;
+  // ---- Process cancellation events ----
+  let cancelVoluntary = 0, cancelFailedPayment = 0, cancelOther = 0, cancelMRRLost = 0;
+  const canceledCustomers = new Set();
 
   for (const event of cancelEvents) {
     const sub = event.data && event.data.object;
@@ -287,7 +238,6 @@ async function fetchStripe(weeks, yearStart, now) {
 
     if (canceledAt >= currentMonthUnix) {
       cancelMRRLost += calcMRR(sub);
-
       const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
       if (reason === 'payment_failed' || reason === 'payment_disputed') {
         cancelFailedPayment += 1;
@@ -304,19 +254,15 @@ async function fetchStripe(weeks, yearStart, now) {
     }
   }
 
-  // Process upgrade/downgrade events
-  let totalUpgrades = 0;
-  let totalDowngrades = 0;
-  let upgradeMRR = 0;
-  let downgradeMRR = 0;
+  // ---- Process upgrade/downgrade events ----
+  let totalUpgrades = 0, totalDowngrades = 0, upgradeMRR = 0, downgradeMRR = 0;
 
   for (const event of updateEvents) {
     const sub = event.data && event.data.object;
     const prev = event.data && event.data.previous_attributes;
     if (!sub || !prev) continue;
 
-    let prevMRR = 0;
-    let currMRR = 0;
+    let prevMRR = 0, currMRR = 0;
 
     if (sub.items && sub.items.data) {
       for (const item of sub.items.data) {
@@ -353,26 +299,16 @@ async function fetchStripe(weeks, yearStart, now) {
     const wi = findWeekIndex(weeks, eventDate);
 
     if (diff > 0) {
-      totalUpgrades += 1;
-      upgradeMRR += diff;
-      if (wi !== -1) {
-        weeklyData[wi].upgrades += 1;
-        weeklyData[wi].upgrade += diff;
-      }
+      totalUpgrades += 1; upgradeMRR += diff;
+      if (wi !== -1) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
     } else {
-      totalDowngrades += 1;
-      downgradeMRR += Math.abs(diff);
-      if (wi !== -1) {
-        weeklyData[wi].downgrades += 1;
-        weeklyData[wi].downgrade += Math.abs(diff);
-      }
+      totalDowngrades += 1; downgradeMRR += Math.abs(diff);
+      if (wi !== -1) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += Math.abs(diff); }
     }
   }
 
-  // 5. Reactivations — no extra API calls needed!
-  //    Cross-reference activeCustomerYTD (from step 1) with canceledCustomers (from step 3)
-  let totalReactivations = 0;
-  let reactivationMRR = 0;
+  // ---- Reactivations — cross-reference in memory, no API calls ----
+  let totalReactivations = 0, reactivationMRR = 0;
 
   for (const [custId, info] of activeCustomerYTD) {
     if (canceledCustomers.has(custId)) {
@@ -395,13 +331,8 @@ async function fetchStripe(weeks, yearStart, now) {
     if (ws >= monthStart) monthImplFees += weeklyData[i].implFeeRevenue;
   }
 
-  // Add $14k adjustment for seat add-ons, upgrades, and metered charges
-  // not captured by subscription item unit_amount
   const ADDON_ADJUSTMENT = 14000;
   const mrrWithImpl = currentMRR + monthImplFees + ADDON_ADJUSTMENT;
-
-  // Prior month MRR = current MRR minus MRR from subs created this month
-  // (those subs didn't exist last month)
   const priorMonthMRR = mrrWithImpl - newMRRThisMonth;
 
   return {
@@ -410,28 +341,22 @@ async function fetchStripe(weeks, yearStart, now) {
     priorMonthMRR: Math.round(priorMonthMRR),
     subscriptionMRR: Math.round(currentMRR),
     implFeesMRR: Math.round(monthImplFees),
-    totalActiveSubs: totalActiveSubs,
-    annualSubs: annualSubs,
-    monthlySubs: monthlySubs,
+    totalActiveSubs, annualSubs, monthlySubs,
     annualRevenue: Math.round(annualRevenue),
     monthlyRevenue: Math.round(monthlyRevenue),
     newRevenueThisMonth: Math.round(newRevenueThisMonth),
     newRevenuePriorMonth: Math.round(newRevenuePriorMonth),
     cancelTotal: cancelVoluntary + cancelFailedPayment + cancelOther,
-    cancelVoluntary: cancelVoluntary,
-    cancelFailedPayment: cancelFailedPayment,
-    cancelOther: cancelOther,
+    cancelVoluntary, cancelFailedPayment, cancelOther,
     cancelMRRLost: Math.round(cancelMRRLost),
-    totalUpgrades: totalUpgrades,
-    totalDowngrades: totalDowngrades,
+    totalUpgrades, totalDowngrades,
     upgradeMRR: Math.round(upgradeMRR),
     downgradeMRR: Math.round(downgradeMRR),
-    totalReactivations: totalReactivations,
+    totalReactivations,
     reactivationMRR: Math.round(reactivationMRR),
     implFeeCount: totalImplFeeCount,
     implFeeRevenue: Math.round(totalImplFeeRevenue),
-    timings: timings,
-    weeks: weeklyData
+    timings, weeks: weeklyData
   };
 }
 
