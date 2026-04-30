@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Upload Stripe Metrics — Trustate</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0f1117; color: #e4e4e7; min-height: 100vh; display: flex; align-items: center; justify-content: center; }
+  .container { max-width: 600px; width: 100%; padding: 40px; }
+  h1 { font-size: 1.5rem; margin-bottom: 8px; }
+  .subtitle { color: #a1a1aa; margin-bottom: 32px; font-size: 0.9rem; }
+  .upload-zone { border: 2px dashed #3f3f46; border-radius: 12px; padding: 48px 24px; text-align: center; cursor: pointer; transition: all 0.2s; margin-bottom: 24px; }
+  .upload-zone:hover, .upload-zone.dragover { border-color: #6366f1; background: rgba(99,102,241,0.05); }
+  .upload-zone input { display: none; }
+  .upload-zone .icon { font-size: 2.5rem; margin-bottom: 12px; }
+  .upload-zone .label { color: #a1a1aa; }
+  .upload-zone .label strong { color: #6366f1; }
+  .preview { background: #1a1b23; border-radius: 12px; padding: 20px; margin-bottom: 24px; display: none; }
+  .preview h3 { font-size: 1rem; margin-bottom: 12px; }
+  .preview .stat { display: flex; justify-content: space-between; padding: 6px 0; border-bottom: 1px solid #27272a; }
+  .preview .stat:last-child { border: none; }
+  .preview .stat .type { font-weight: 500; }
+  .preview .stat .count { color: #a1a1aa; }
+  .preview .stat .mrr { font-family: monospace; }
+  .preview .stat .mrr.positive { color: #22c55e; }
+  .preview .stat .mrr.negative { color: #ef4444; }
+  .btn { display: block; width: 100%; padding: 14px; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.2s; }
+  .btn-primary { background: #6366f1; color: white; }
+  .btn-primary:hover { background: #5558e6; }
+  .btn-primary:disabled { background: #3f3f46; color: #71717a; cursor: not-allowed; }
+  .status { text-align: center; margin-top: 16px; padding: 12px; border-radius: 8px; display: none; }
+  .status.success { display: block; background: rgba(34,197,94,0.1); color: #22c55e; }
+  .status.error { display: block; background: rgba(239,68,68,0.1); color: #ef4444; }
+  .back-link { display: block; text-align: center; margin-top: 20px; color: #6366f1; text-decoration: none; font-size: 0.9rem; }
+  .back-link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>Upload Stripe Subscription Metrics</h1>
+  <p class="subtitle">Upload the .xlsx report from Stripe Dashboard → Billing → Subscriptions → Export</p>
+
+  <div class="upload-zone" id="dropZone">
+    <div class="icon">📊</div>
+    <div class="label">Drag & drop your <strong>.xlsx file</strong> here, or click to browse</div>
+    <input type="file" id="fileInput" accept=".xlsx,.xls,.csv">
+  </div>
+
+  <div class="preview" id="preview">
+    <h3 id="previewTitle">Preview</h3>
+    <div id="previewStats"></div>
+  </div>
+
+  <button class="btn btn-primary" id="uploadBtn" disabled>Upload to Dashboard</button>
+  <div class="status" id="status"></div>
+  <a href="/" class="back-link">← Back to Dashboard</a>
+</div>
+
+<script>
+  var parsedEvents = null;
+
+  var dropZone = document.getElementById('dropZone');
+  var fileInput = document.getElementById('fileInput');
+  var preview = document.getElementById('preview');
+  var previewTitle = document.getElementById('previewTitle');
+  var previewStats = document.getElementById('previewStats');
+  var uploadBtn = document.getElementById('uploadBtn');
+  var statusEl = document.getElementById('status');
+
+  dropZone.addEventListener('click', function() { fileInput.click(); });
+  dropZone.addEventListener('dragover', function(e) { e.preventDefault(); dropZone.classList.add('dragover'); });
+  dropZone.addEventListener('dragleave', function() { dropZone.classList.remove('dragover'); });
+  dropZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    dropZone.classList.remove('dragover');
+    if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+  });
+  fileInput.addEventListener('change', function() {
+    if (fileInput.files.length) handleFile(fileInput.files[0]);
+  });
+
+  function handleFile(file) {
+    statusEl.className = 'status';
+    statusEl.style.display = 'none';
+
+    var reader = new FileReader();
+    reader.onload = function(e) {
+      try {
+        var wb = XLSX.read(e.target.result, { type: 'array', cellDates: true });
+        var sheet = wb.Sheets[wb.SheetNames[0]];
+        var rows = XLSX.utils.sheet_to_json(sheet, { raw: false });
+
+        if (!rows.length) throw new Error('No data found in file');
+
+        // Map columns — handle various column name formats
+        parsedEvents = rows.map(function(row) {
+          var ts = row.event_timestamp || row.timestamp || row.date || '';
+          var type = row.event_type || row.type || '';
+          var custId = row.customer_id || row.customer || '';
+          var currency = row.currency || 'usd';
+          var mrr = parseFloat(row.mrr_change || row.mrr || 0);
+
+          return {
+            event_timestamp: new Date(ts).toISOString(),
+            event_type: type,
+            customer_id: custId,
+            currency: currency,
+            mrr_change: mrr
+          };
+        }).filter(function(e) { return e.event_type && e.customer_id; });
+
+        if (!parsedEvents.length) throw new Error('Could not parse events. Check column names: event_timestamp, event_type, customer_id, mrr_change');
+
+        // Show preview
+        var summary = {};
+        parsedEvents.forEach(function(e) {
+          if (!summary[e.event_type]) summary[e.event_type] = { count: 0, mrr: 0 };
+          summary[e.event_type].count += 1;
+          summary[e.event_type].mrr += e.mrr_change;
+        });
+
+        var dates = parsedEvents.map(function(e) { return new Date(e.event_timestamp); });
+        var minDate = new Date(Math.min.apply(null, dates));
+        var maxDate = new Date(Math.max.apply(null, dates));
+        var months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        previewTitle.textContent = months[minDate.getMonth()] + ' ' + minDate.getDate() + ' – ' + months[maxDate.getMonth()] + ' ' + maxDate.getDate() + ', ' + maxDate.getFullYear() + ' (' + parsedEvents.length + ' events)';
+
+        var html = '';
+        var order = ['Churn', 'New', 'Reactivation', 'Upgrade', 'Downgrade'];
+        order.forEach(function(type) {
+          if (summary[type]) {
+            var mrr = summary[type].mrr;
+            var cls = mrr >= 0 ? 'positive' : 'negative';
+            var sign = mrr >= 0 ? '+' : '';
+            html += '<div class="stat"><span class="type">' + type + '</span><span class="count">' + summary[type].count + ' events</span><span class="mrr ' + cls + '">' + sign + '$' + mrr.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:2}) + '</span></div>';
+          }
+        });
+        // Any other types
+        Object.keys(summary).forEach(function(type) {
+          if (order.indexOf(type) === -1) {
+            html += '<div class="stat"><span class="type">' + type + '</span><span class="count">' + summary[type].count + '</span><span class="mrr">$' + summary[type].mrr.toFixed(2) + '</span></div>';
+          }
+        });
+
+        previewStats.innerHTML = html;
+        preview.style.display = 'block';
+        uploadBtn.disabled = false;
+
+      } catch (err) {
+        statusEl.textContent = 'Error parsing file: ' + err.message;
+        statusEl.className = 'status error';
+        parsedEvents = null;
+        uploadBtn.disabled = true;
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+
+  uploadBtn.addEventListener('click', function() {
+    if (!parsedEvents) return;
+
+    uploadBtn.disabled = true;
+    uploadBtn.textContent = 'Uploading...';
+    statusEl.style.display = 'none';
+
+    fetch('/api/upload-metrics', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        events: parsedEvents,
+        batch: new Date().toISOString()
+      })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      if (data.success) {
+        statusEl.textContent = 'Uploaded ' + data.inserted + ' events (' + data.dateRange + '). Dashboard will reflect these metrics immediately.';
+        statusEl.className = 'status success';
+      } else {
+        throw new Error(data.error || 'Upload failed');
+      }
+      uploadBtn.textContent = 'Upload to Dashboard';
+      uploadBtn.disabled = false;
+    })
+    .catch(function(err) {
+      statusEl.textContent = 'Upload failed: ' + err.message;
+      statusEl.className = 'status error';
+      uploadBtn.textContent = 'Upload to Dashboard';
+      uploadBtn.disabled = false;
+    });
+  });
+</script>
+</body>
+</html>
