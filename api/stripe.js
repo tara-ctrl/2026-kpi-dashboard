@@ -201,216 +201,172 @@ async function fetchStripe(weeks, yearStart, now) {
     pages++;
   }
 
-  // 2. Implementation fee invoices — skip expand, search by product directly
-  //    Use line_items endpoint per invoice would be slow, so search invoices
-  //    and filter by metadata or just count paid invoices with the impl product
+  // 2-4. Run invoices, cancellation events, and upgrade events IN PARALLEL
+  //       to cut wall-clock time dramatically
   const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
-  hasMore = true;
-  startingAfter = '';
-  pages = 0;
+  const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
+
+  // Helper for paginated fetches
+  async function paginatedFetch(urlBase, maxPages, label) {
+    const results = [];
+    let hasMore2 = true, sa = '', pg = 0;
+    while (hasMore2 && pg < maxPages) {
+      const pt = Date.now();
+      const url = urlBase + (sa ? '&starting_after=' + sa : '');
+      const resp = await fetch(url, { headers });
+      const data = await resp.json();
+      timings.push(label + '_p' + (pg+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+      if (data.error) throw new Error(label + ' error: ' + data.error.message);
+      if (data.data) results.push(...data.data);
+      hasMore2 = data.has_more;
+      if (data.data && data.data.length > 0) sa = data.data[data.data.length - 1].id;
+      pg++;
+    }
+    return results;
+  }
+
+  const [invoices, cancelEvents, updateEvents] = await Promise.all([
+    paginatedFetch(
+      'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix + '&limit=100&expand[]=data.lines',
+      6, 'inv'
+    ),
+    paginatedFetch(
+      'https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100',
+      3, 'cancel_ev'
+    ),
+    paginatedFetch(
+      'https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100',
+      2, 'upd_ev'
+    )
+  ]);
+
+  // Process invoices for impl fees
   let totalImplFeeRevenue = 0;
   let totalImplFeeCount = 0;
-
-  // Use search API for invoices with specific product (faster, no expand needed)
-  // Fallback: just fetch invoices without expansion and check line items in first page
-  while (hasMore && pages < 8) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
-      '&limit=100&expand[]=data.lines' +
-      (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('inv_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
-
-    if (data.error) throw new Error('Stripe invoices error: ' + data.error.message);
-
-    for (const inv of data.data) {
-      const createdAt = new Date(inv.created * 1000);
-      const wi = findWeekIndex(weeks, createdAt);
-
-      if (inv.lines && inv.lines.data) {
-        for (const line of inv.lines.data) {
-          const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
-          if (productId === IMPL_PRODUCT) {
-            const amount = (line.amount || 0) / 100;
-            totalImplFeeCount += 1;
-            totalImplFeeRevenue += amount;
-            if (wi !== -1) {
-              weeklyData[wi].implFeeCount += 1;
-              weeklyData[wi].implFeeRevenue += amount;
-            }
+  for (const inv of invoices) {
+    const createdAt = new Date(inv.created * 1000);
+    const wi = findWeekIndex(weeks, createdAt);
+    if (inv.lines && inv.lines.data) {
+      for (const line of inv.lines.data) {
+        const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
+        if (productId === IMPL_PRODUCT) {
+          const amount = (line.amount || 0) / 100;
+          totalImplFeeCount += 1;
+          totalImplFeeRevenue += amount;
+          if (wi !== -1) {
+            weeklyData[wi].implFeeCount += 1;
+            weeklyData[wi].implFeeRevenue += amount;
           }
         }
       }
     }
-    hasMore = data.has_more;
-    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    pages++;
   }
 
-  // 3. Cancellations — use Events API (customer.subscription.deleted) for accurate
-  //    chronological data. Events are ordered by date, so we get all current-month
-  //    cancellations reliably without the creation-date ordering problem.
-  //    Also fetch a broader set for reactivation customer ID tracking.
-  hasMore = true;
-  startingAfter = '';
-  pages = 0;
+  // Process cancellation events
   let cancelVoluntary = 0;
   let cancelFailedPayment = 0;
   let cancelOther = 0;
   let cancelMRRLost = 0;
-  const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
 
-  // Fetch cancellation events for YTD (for weekly chart + reactivation tracking)
-  while (hasMore && pages < 5) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/events?type=customer.subscription.deleted' +
-      '&created[gte]=' + yearStartUnix + '&limit=100' +
-      (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('cancel_ev_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+  for (const event of cancelEvents) {
+    const sub = event.data && event.data.object;
+    if (!sub) continue;
 
-    if (data.error) throw new Error('Stripe cancel events error: ' + data.error.message);
+    canceledCustomers.add(sub.customer);
 
-    for (const event of data.data) {
-      const sub = event.data && event.data.object;
-      if (!sub) continue;
+    const canceledAt = sub.canceled_at || event.created;
+    const cancelDate = new Date(canceledAt * 1000);
+    const cwi = findWeekIndex(weeks, cancelDate);
+    if (cwi !== -1) weeklyData[cwi].cancellations += 1;
 
-      // Track customer for reactivation detection
-      canceledCustomers.add(sub.customer);
+    const subCreated = new Date(sub.created * 1000);
+    if (subCreated >= yearStart) {
+      const swi = findWeekIndex(weeks, subCreated);
+      if (swi !== -1) weeklyData[swi].newSubs += 1;
+    }
 
-      const canceledAt = sub.canceled_at || event.created;
-      const cancelDate = new Date((canceledAt) * 1000);
+    if (canceledAt >= currentMonthUnix) {
+      cancelMRRLost += calcMRR(sub);
 
-      // Bucket into weekly chart
-      const cwi = findWeekIndex(weeks, cancelDate);
-      if (cwi !== -1) weeklyData[cwi].cancellations += 1;
-
-      // Also count as new sub in the week it was created (if YTD)
-      const subCreated = new Date(sub.created * 1000);
-      if (subCreated >= yearStart) {
-        const swi = findWeekIndex(weeks, subCreated);
-        if (swi !== -1) weeklyData[swi].newSubs += 1;
-      }
-
-      // Current month totals for KPI card
-      if (canceledAt >= currentMonthUnix) {
-        const lostMRR = calcMRR(sub);
-        cancelMRRLost += lostMRR;
-
-        // Determine cancellation reason
-        const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
-        // Check both the reason field AND whether the last invoice was unpaid
-        // Stripe sets reason to 'payment_failed' for dunning failures,
-        // but also check 'automatic' cancellation with unpaid status
-        if (reason === 'payment_failed' || reason === 'payment_disputed') {
+      const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
+      if (reason === 'payment_failed' || reason === 'payment_disputed') {
+        cancelFailedPayment += 1;
+      } else if (reason === 'cancellation_requested') {
+        cancelVoluntary += 1;
+      } else {
+        const cancelFeedback = (sub.cancellation_details && sub.cancellation_details.feedback) || '';
+        if (sub.status === 'canceled' && reason === '' && cancelFeedback === '') {
           cancelFailedPayment += 1;
-        } else if (reason === 'cancellation_requested') {
-          cancelVoluntary += 1;
         } else {
-          // For subs canceled automatically (not by customer request),
-          // check if it was likely a payment failure
-          const cancelFeedback = (sub.cancellation_details && sub.cancellation_details.feedback) || '';
-          if (sub.status === 'canceled' && reason === '' && cancelFeedback === '') {
-            // No reason and no feedback = likely automatic cancellation from failed payment
-            cancelFailedPayment += 1;
-          } else {
-            cancelOther += 1;
-          }
+          cancelOther += 1;
         }
       }
     }
-
-    hasMore = data.has_more;
-    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    pages++;
   }
 
-  // 4. Upgrades & Downgrades — via subscription update events where price changed
-  //    Uses Stripe Events API: customer.subscription.updated with previous_attributes
-  //    Limited to 1 page (100 events) to stay within timeout budget
-  hasMore = true;
-  startingAfter = '';
-  pages = 0;
+  // Process upgrade/downgrade events
   let totalUpgrades = 0;
   let totalDowngrades = 0;
   let upgradeMRR = 0;
   let downgradeMRR = 0;
 
-  while (hasMore && pages < 2) {
-    const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/events?type=customer.subscription.updated' +
-      '&created[gte]=' + yearStartUnix + '&limit=100' +
-      (startingAfter ? '&starting_after=' + startingAfter : '');
-    const resp = await fetch(url, { headers });
-    const data = await resp.json();
-    timings.push('events_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+  for (const event of updateEvents) {
+    const sub = event.data && event.data.object;
+    const prev = event.data && event.data.previous_attributes;
+    if (!sub || !prev) continue;
 
-    if (data.error) { console.error('Stripe events error:', data.error.message); break; }
+    let prevMRR = 0;
+    let currMRR = 0;
 
-    for (const event of data.data) {
-      const sub = event.data && event.data.object;
-      const prev = event.data && event.data.previous_attributes;
-      if (!sub || !prev) continue;
-
-      let prevMRR = 0;
-      let currMRR = 0;
-
-      if (sub.items && sub.items.data) {
-        for (const item of sub.items.data) {
-          const price = item.price || item.plan;
-          if (!price) continue;
-          const amount = (price.unit_amount || 0) / 100;
-          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-          const qty = item.quantity || 1;
-          currMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
-        }
-      }
-
-      if (prev.items && prev.items.data) {
-        for (const item of prev.items.data) {
-          const price = item.price || item.plan;
-          if (!price) continue;
-          const amount = (price.unit_amount || 0) / 100;
-          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-          const qty = item.quantity || 1;
-          prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
-        }
-      } else if (prev.plan) {
-        const amount = (prev.plan.amount || 0) / 100;
-        const interval = prev.plan.interval || 'month';
-        prevMRR = interval === 'year' ? amount / 12 : amount;
-      } else {
-        continue;
-      }
-
-      const diff = currMRR - prevMRR;
-      if (Math.abs(diff) < 1) continue;
-
-      const eventDate = new Date(event.created * 1000);
-      const wi = findWeekIndex(weeks, eventDate);
-
-      if (diff > 0) {
-        totalUpgrades += 1;
-        upgradeMRR += diff;
-        if (wi !== -1) {
-          weeklyData[wi].upgrades += 1;
-          weeklyData[wi].upgrade += diff;
-        }
-      } else {
-        totalDowngrades += 1;
-        downgradeMRR += Math.abs(diff);
-        if (wi !== -1) {
-          weeklyData[wi].downgrades += 1;
-          weeklyData[wi].downgrade += Math.abs(diff);
-        }
+    if (sub.items && sub.items.data) {
+      for (const item of sub.items.data) {
+        const price = item.price || item.plan;
+        if (!price) continue;
+        const amount = (price.unit_amount || 0) / 100;
+        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+        const qty = item.quantity || 1;
+        currMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
       }
     }
 
-    hasMore = data.has_more;
-    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
-    pages++;
+    if (prev.items && prev.items.data) {
+      for (const item of prev.items.data) {
+        const price = item.price || item.plan;
+        if (!price) continue;
+        const amount = (price.unit_amount || 0) / 100;
+        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+        const qty = item.quantity || 1;
+        prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
+      }
+    } else if (prev.plan) {
+      const amount = (prev.plan.amount || 0) / 100;
+      const interval = prev.plan.interval || 'month';
+      prevMRR = interval === 'year' ? amount / 12 : amount;
+    } else {
+      continue;
+    }
+
+    const diff = currMRR - prevMRR;
+    if (Math.abs(diff) < 1) continue;
+
+    const eventDate = new Date(event.created * 1000);
+    const wi = findWeekIndex(weeks, eventDate);
+
+    if (diff > 0) {
+      totalUpgrades += 1;
+      upgradeMRR += diff;
+      if (wi !== -1) {
+        weeklyData[wi].upgrades += 1;
+        weeklyData[wi].upgrade += diff;
+      }
+    } else {
+      totalDowngrades += 1;
+      downgradeMRR += Math.abs(diff);
+      if (wi !== -1) {
+        weeklyData[wi].downgrades += 1;
+        weeklyData[wi].downgrade += Math.abs(diff);
+      }
+    }
   }
 
   // 5. Reactivations — no extra API calls needed!
