@@ -1,6 +1,7 @@
-// /api/stripe-events — Handles cancellations, upgrades, downgrades, reactivations
-// Separate from /api/stripe to stay within Vercel's 30s serverless limit
-// Frontend calls both endpoints in parallel and merges results
+// /api/stripe-events — Subscription metrics matching Stripe's report definitions
+// Classifies events at the CUSTOMER level (not subscription level) to match
+// Stripe's subscription metrics: Churn, New, Reactivation, Upgrade, Downgrade
+// Also tracks failed payments separately
 
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -23,98 +24,58 @@ module.exports = async (req, res) => {
   const t0 = Date.now();
 
   try {
-    // Fetch all event types in parallel
-    const [cancelEvents, cancelEventsYTD, failedPaymentEvents, updateEvents, createdEvents] = await Promise.all([
-      // Current month cancellations (for KPI card)
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'cancel_ev', headers, timings),
-      // YTD cancellations (for weekly chart + reactivation detection)
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 3, 'cancel_ytd', headers, timings),
-      // Failed payments this month
-      paginatedFetch('https://api.stripe.com/v1/events?type=invoice.payment_failed&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'fail_ev', headers, timings),
-      // Upgrade/downgrade events YTD
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 3, 'upd_ev', headers, timings),
-      // New subscriptions this month (for resubscribe detection)
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.created&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'created_ev', headers, timings)
+    // Fetch ALL subscription event types for the month + failed payments in parallel
+    // Also fetch YTD cancellations for weekly chart and prior-customer detection
+    const [deletedEvents, createdEvents, updatedEvents, deletedYTD, failedPaymentEvents] = await Promise.all([
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'del', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.created&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'cre', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + currentMonthUnix + '&limit=100', 3, 'upd', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 3, 'del_ytd', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=invoice.payment_failed&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'fail', headers, timings)
     ]);
 
-    // Build set of all canceled customer IDs (YTD) for resubscribe detection
-    const canceledCustomers = new Set();
-    for (const event of cancelEventsYTD) {
-      const sub = event.data && event.data.object;
-      if (sub) canceledCustomers.add(sub.customer);
-    }
-
-    // Process current month cancellations (for KPI card)
-    let cancelVoluntary = 0, cancelFailedPayment = 0, cancelOther = 0, cancelMRRLost = 0;
-    const weeklyCancel = weeks.map(() => 0);
-
-    // Use YTD events for weekly chart bucketing
-    for (const event of cancelEventsYTD) {
+    // Build set of customers who canceled before this month (for reactivation detection)
+    const priorCanceledCustomers = new Set();
+    for (const event of deletedYTD) {
       const sub = event.data && event.data.object;
       if (!sub) continue;
       const canceledAt = sub.canceled_at || event.created;
-      const cancelDate = new Date(canceledAt * 1000);
-      const cwi = findWeekIndex(weeks, cancelDate);
-      if (cwi !== -1) weeklyCancel[cwi] += 1;
-    }
-
-    // Current month cancellations for KPI breakdown
-    for (const event of cancelEvents) {
-      const sub = event.data && event.data.object;
-      if (!sub) continue;
-
-      const canceledAt = sub.canceled_at || event.created;
-      if (canceledAt >= currentMonthUnix) {
-        cancelMRRLost += calcMRR(sub);
-
-        const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
-        const wasAutomatic = !event.request || !event.request.id;
-
-        if (reason === 'payment_failed' || reason === 'payment_disputed') {
-          cancelFailedPayment += 1;
-        } else if (wasAutomatic) {
-          cancelFailedPayment += 1;
-        } else {
-          cancelVoluntary += 1;
-        }
+      if (canceledAt < currentMonthUnix) {
+        priorCanceledCustomers.add(sub.customer);
       }
     }
 
-    // Detect resubscribes — new subs this month from customers who previously canceled
-    let resubscribeCount = 0;
-    let resubscribeMRR = 0;
+    // ============================================================
+    // CUSTOMER-LEVEL MRR CLASSIFICATION (matches Stripe's metrics)
+    // ============================================================
+    // Collect all MRR changes per customer this month, then classify
 
+    // Track per-customer: { mrrChanges: [{amount, timestamp, type}] }
+    const customerEvents = {};
+
+    function addCustomerEvent(customerId, mrrChange, timestamp, eventType) {
+      if (!customerEvents[customerId]) customerEvents[customerId] = [];
+      customerEvents[customerId].push({ mrrChange, timestamp, eventType });
+    }
+
+    // Deleted subs = negative MRR
+    for (const event of deletedEvents) {
+      const sub = event.data && event.data.object;
+      if (!sub) continue;
+      const mrr = calcMRR(sub);
+      addCustomerEvent(sub.customer, -mrr, event.created, 'deleted');
+    }
+
+    // Created subs = positive MRR
     for (const event of createdEvents) {
       const sub = event.data && event.data.object;
       if (!sub) continue;
-
-      if (canceledCustomers.has(sub.customer)) {
-        resubscribeCount += 1;
-        resubscribeMRR += calcMRR(sub);
-      }
+      const mrr = calcMRR(sub);
+      addCustomerEvent(sub.customer, mrr, event.created, 'created');
     }
 
-    // Process failed payments (distinct from cancellations)
-    // These are invoice payment attempts that failed (card declined, etc.)
-    let failedPaymentCount = 0;
-    let failedPaymentAmount = 0;
-    const failedCustomers = new Set(); // dedupe by customer
-
-    for (const event of failedPaymentEvents) {
-      const invoice = event.data && event.data.object;
-      if (!invoice) continue;
-
-      // Count unique failed payment events this month
-      failedPaymentCount += 1;
-      failedPaymentAmount += (invoice.amount_due || 0) / 100;
-    }
-
-    // Process upgrades/downgrades
-    let totalUpgrades = 0, totalDowngrades = 0, upgradeMRR = 0, downgradeMRR = 0;
-    const weeklyUpgrades = weeks.map(() => 0);
-    const weeklyDowngrades = weeks.map(() => 0);
-
-    for (const event of updateEvents) {
+    // Updated subs = MRR diff (upgrade or downgrade)
+    for (const event of updatedEvents) {
       const sub = event.data && event.data.object;
       const prev = event.data && event.data.previous_attributes;
       if (!sub || !prev) continue;
@@ -152,35 +113,114 @@ module.exports = async (req, res) => {
       const diff = currMRR - prevMRR;
       if (Math.abs(diff) < 1) continue;
 
-      const eventDate = new Date(event.created * 1000);
+      addCustomerEvent(sub.customer, diff, event.created, 'updated');
+    }
+
+    // Now classify each customer's net MRR movement
+    let churnCount = 0, churnMRR = 0;
+    let newCount = 0, newMRR = 0;
+    let reactivationCount = 0, reactivationMRR = 0;
+    let upgradeCount = 0, upgradeMRR = 0;
+    let downgradeCount = 0, downgradeMRR = 0;
+
+    const weeklyChurn = weeks.map(() => 0);
+    const weeklyUpgrades = weeks.map(() => 0);
+    const weeklyDowngrades = weeks.map(() => 0);
+
+    for (const [customerId, events] of Object.entries(customerEvents)) {
+      const netMRR = events.reduce((sum, e) => sum + e.mrrChange, 0);
+      const hasCreated = events.some(e => e.eventType === 'created');
+      const hasDeleted = events.some(e => e.eventType === 'deleted');
+      const wasPreviousCustomer = priorCanceledCustomers.has(customerId);
+
+      // Use the latest event timestamp for weekly bucketing
+      const latestTimestamp = Math.max(...events.map(e => e.timestamp));
+      const eventDate = new Date(latestTimestamp * 1000);
       const wi = findWeekIndex(weeks, eventDate);
 
-      if (diff > 0) {
-        totalUpgrades += 1; upgradeMRR += diff;
-        if (wi !== -1) weeklyUpgrades[wi] += 1;
-      } else {
-        totalDowngrades += 1; downgradeMRR += Math.abs(diff);
+      if (Math.abs(netMRR) < 0.50) continue; // Ignore tiny rounding differences
+
+      if (netMRR < 0 && hasDeleted && !hasCreated) {
+        // Customer lost MRR and deleted a sub without creating a new one = Churn
+        churnCount += 1;
+        churnMRR += Math.abs(netMRR);
+        if (wi !== -1) weeklyChurn[wi] += 1;
+      } else if (netMRR < 0 && !hasDeleted) {
+        // MRR decreased but sub still active = Downgrade
+        downgradeCount += 1;
+        downgradeMRR += Math.abs(netMRR);
         if (wi !== -1) weeklyDowngrades[wi] += 1;
+      } else if (netMRR < 0 && hasDeleted && hasCreated) {
+        // Deleted old sub AND created new one, but net negative = Downgrade
+        downgradeCount += 1;
+        downgradeMRR += Math.abs(netMRR);
+        if (wi !== -1) weeklyDowngrades[wi] += 1;
+      } else if (netMRR > 0 && hasCreated && wasPreviousCustomer) {
+        // Positive MRR, new sub, had a prior cancellation = Reactivation
+        reactivationCount += 1;
+        reactivationMRR += netMRR;
+      } else if (netMRR > 0 && hasCreated && !wasPreviousCustomer) {
+        // Positive MRR, new sub, no prior history = New
+        newCount += 1;
+        newMRR += netMRR;
+      } else if (netMRR > 0 && !hasCreated) {
+        // MRR increased, no new sub = Upgrade
+        upgradeCount += 1;
+        upgradeMRR += netMRR;
+        if (wi !== -1) weeklyUpgrades[wi] += 1;
+      } else if (netMRR > 0 && hasCreated && hasDeleted) {
+        // Deleted old sub AND created new one, net positive = Upgrade
+        upgradeCount += 1;
+        upgradeMRR += netMRR;
+        if (wi !== -1) weeklyUpgrades[wi] += 1;
       }
+    }
+
+    // YTD weekly cancellations for chart
+    const weeklyChurnYTD = weeks.map(() => 0);
+    for (const event of deletedYTD) {
+      const sub = event.data && event.data.object;
+      if (!sub) continue;
+      const canceledAt = sub.canceled_at || event.created;
+      const cancelDate = new Date(canceledAt * 1000);
+      const cwi = findWeekIndex(weeks, cancelDate);
+      if (cwi !== -1) weeklyChurnYTD[cwi] += 1;
+    }
+
+    // Failed payments
+    let failedPaymentCount = 0;
+    let failedPaymentAmount = 0;
+    for (const event of failedPaymentEvents) {
+      const invoice = event.data && event.data.object;
+      if (!invoice) continue;
+      failedPaymentCount += 1;
+      failedPaymentAmount += (invoice.amount_due || 0) / 100;
     }
 
     timings.push('total:' + (Date.now() - t0) + 'ms');
 
     res.status(200).json({
-      cancelTotal: cancelVoluntary + cancelFailedPayment + cancelOther,
-      cancelVoluntary, cancelFailedPayment, cancelOther,
-      cancelMRRLost: Math.round(cancelMRRLost),
-      failedPaymentCount,
-      failedPaymentAmount: Math.round(failedPaymentAmount),
-      totalUpgrades, totalDowngrades,
-      upgradeMRR: Math.round(upgradeMRR),
-      downgradeMRR: Math.round(downgradeMRR),
-      resubscribeCount,
-      resubscribeMRR: Math.round(resubscribeMRR),
+      // Matches Stripe's subscription metrics categories
+      churnCount, churnMRR: Math.round(churnMRR),
+      newCount, newMRR: Math.round(newMRR),
+      reactivationCount, reactivationMRR: Math.round(reactivationMRR),
+      upgradeCount, upgradeMRR: Math.round(upgradeMRR),
+      downgradeCount, downgradeMRR: Math.round(downgradeMRR),
+      failedPaymentCount, failedPaymentAmount: Math.round(failedPaymentAmount),
+      // Legacy fields for backwards compatibility
+      cancelTotal: churnCount,
+      cancelVoluntary: churnCount,
+      cancelFailedPayment: 0,
+      cancelOther: 0,
+      cancelMRRLost: Math.round(churnMRR),
+      totalUpgrades: upgradeCount,
+      totalDowngrades: downgradeCount,
+      resubscribeCount: reactivationCount,
+      resubscribeMRR: Math.round(reactivationMRR),
       timings,
       weeks: weeks.map((w, i) => ({
         weekOf: w.label,
-        cancellations: weeklyCancel[i],
+        cancellations: weeklyChurnYTD[i],
         upgrades: weeklyUpgrades[i],
         downgrades: weeklyDowngrades[i]
       }))
@@ -190,7 +230,6 @@ module.exports = async (req, res) => {
   }
 };
 
-// Helper for paginated fetches
 async function paginatedFetch(urlBase, maxPages, label, headers, timings) {
   const results = [];
   let hasMore = true, sa = '', pg = 0;
