@@ -30,16 +30,28 @@ module.exports = async (req, res) => {
       paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'del', headers, timings),
       paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.created&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'cre', headers, timings),
       paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + currentMonthUnix + '&limit=100', 4, 'upd', headers, timings),
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 3, 'del_ytd', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 5, 'del_ytd', headers, timings),
       paginatedFetch('https://api.stripe.com/v1/events?type=invoice.payment_failed&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'fail', headers, timings)
     ]);
 
     // Build set of customers who canceled before this month (for reactivation detection)
+    // Use both YTD deletion events AND a quick scan of canceled subs
     const priorCanceledCustomers = new Set();
     for (const event of deletedYTD) {
       const sub = event.data && event.data.object;
       if (!sub) continue;
       if (event.created < currentMonthUnix) priorCanceledCustomers.add(sub.customer);
+    }
+    // Also scan canceled subs directly (catches cancellations from before YTD)
+    const canceledSubs = await paginatedFetch(
+      'https://api.stripe.com/v1/subscriptions?status=canceled&limit=100',
+      3, 'canceled_scan', headers, timings
+    );
+    for (const sub of canceledSubs) {
+      const canceledAt = sub.canceled_at || 0;
+      if (canceledAt > 0 && canceledAt < currentMonthUnix) {
+        priorCanceledCustomers.add(sub.customer);
+      }
     }
     // Also add customers from current month deletions that happened BEFORE their creation
     const deletedTimestamps = {};
@@ -106,8 +118,9 @@ module.exports = async (req, res) => {
     }
 
     // ============================================================
-    // UPGRADES & DOWNGRADES: updated subs with MRR change
+    // UPGRADES: updated subs with MRR increase
     // Stripe counts EACH individual price change event
+    // Strategy: for each updated event, try multiple methods to detect MRR change
     // ============================================================
     let upgradeCount = 0, upgradeMRR = 0;
     let downgradeCount = 0, downgradeMRR = 0;
@@ -119,14 +132,12 @@ module.exports = async (req, res) => {
       const prev = event.data && event.data.previous_attributes;
       if (!sub || !prev) continue;
 
-      // Check if items or plan changed (skip status-only updates)
-      if (!prev.items && !prev.plan && !prev.quantity) continue;
-
       let currMRR = calcMRR(sub);
+      let prevMRR = -1; // -1 = not determined
 
-      // Calculate previous MRR
-      let prevMRR = 0;
-      if (prev.items && prev.items.data) {
+      // Method 1: previous_attributes has full items array
+      if (prev.items && prev.items.data && prev.items.data.length > 0) {
+        prevMRR = 0;
         for (const item of prev.items.data) {
           const price = item.price || item.plan;
           if (!price) continue;
@@ -135,29 +146,42 @@ module.exports = async (req, res) => {
           const qty = item.quantity || 1;
           prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
         }
-      } else if (prev.plan) {
+      }
+
+      // Method 2: previous_attributes has plan object
+      if (prevMRR < 0 && prev.plan) {
         const amount = (prev.plan.amount || 0) / 100;
         const interval = prev.plan.interval || 'month';
-        const qty = prev.quantity || (sub.quantity || 1);
+        const qty = sub.quantity || 1;
         prevMRR = interval === 'year' ? (amount * qty) / 12 : amount * qty;
-      } else {
-        // Items/plan didn't change in prev attributes — might be quantity change
-        // Recalculate using current items but previous quantity
-        if (prev.quantity !== undefined && sub.items && sub.items.data) {
-          for (const item of sub.items.data) {
-            const price = item.price || item.plan;
-            if (!price) continue;
-            const amount = (price.unit_amount || 0) / 100;
-            const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-            prevMRR += interval === 'year' ? (amount * prev.quantity) / 12 : amount * prev.quantity;
-          }
-        } else {
-          continue;
+      }
+
+      // Method 3: quantity changed — use current price with old quantity
+      if (prevMRR < 0 && prev.quantity !== undefined && sub.items && sub.items.data) {
+        prevMRR = 0;
+        for (const item of sub.items.data) {
+          const price = item.price || item.plan;
+          if (!price) continue;
+          const amount = (price.unit_amount || 0) / 100;
+          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+          prevMRR += interval === 'year' ? (amount * prev.quantity) / 12 : amount * prev.quantity;
         }
       }
 
-      const diff = currMRR - prevMRR;
-      if (Math.abs(diff) < 0.50) continue; // Skip rounding noise
+      // Method 4: items changed but prev.items.data items don't have price details
+      // Check if the price ID changed — indicates a plan switch
+      if (prevMRR < 0 && prev.items) {
+        // prev.items might have a different structure — try to detect any change
+        // If we can't compute prev MRR but items DID change, use the event's
+        // previous_attributes to at least detect the direction
+        // Skip — we can't determine the MRR diff reliably
+        continue;
+      }
+
+      if (prevMRR < 0) continue; // Couldn't determine previous MRR
+
+      const diff = Math.round((currMRR - prevMRR) * 100) / 100;
+      if (Math.abs(diff) < 0.50) continue;
 
       const eventDate = new Date(event.created * 1000);
       const wi = findWeekIndex(weeks, eventDate);
