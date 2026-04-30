@@ -1,7 +1,6 @@
-// /api/stripe — Unified endpoint: fetches from Stripe, HubSpot, AND Supabase
-// Uses native fetch — no npm packages required
-// Returns combined data from all three sources in one response
-// Optimized with timeouts and pagination limits to avoid serverless timeout
+// /api/stripe — Core Stripe + HubSpot + Supabase data
+// Events-based data (cancellations, upgrades) handled by /api/stripe-events
+// Split into two endpoints to stay within Vercel's 30s serverless limit
 
 // Excluded test/fake portal IDs
 const EXCLUDED_PORTALS = [
@@ -26,7 +25,7 @@ const EXCLUDED_PORTALS = [
   '1f25b2d3-56fc-4835-8eb7-074367c06a25',
   'cd2cfafa-4d53-457f-94bf-19fa164abd34'
 ];
-const MAX_PAGES = 7; // Max pagination pages per endpoint (700 subs capacity)
+const MAX_PAGES = 8; // Max pagination pages per endpoint (800 subs capacity)
 const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
 const SERVICE_TIMEOUT = 28000; // 28s max per service (function has 30s limit)
 
@@ -123,202 +122,100 @@ async function fetchStripe(weeks, yearStart, now) {
 
   const currentMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
   const priorMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
-  const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
   const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
 
-  // Helper for paginated fetches — collects raw results
-  async function paginatedFetch(urlBase, maxPages, label) {
-    const results = [];
-    let hasMore2 = true, sa = '', pg = 0;
-    while (hasMore2 && pg < maxPages) {
-      const pt = Date.now();
-      const url = urlBase + (sa ? '&starting_after=' + sa : '');
-      const resp = await fetch(url, { headers });
-      const data = await resp.json();
-      timings.push(label + '_p' + (pg+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
-      if (data.error) throw new Error(label + ' error: ' + data.error.message);
-      if (data.data) results.push(...data.data);
-      hasMore2 = data.has_more;
-      if (data.data && data.data.length > 0) sa = data.data[data.data.length - 1].id;
-      pg++;
-    }
-    return results;
-  }
-
-  // *** ALL API CALLS RUN IN PARALLEL ***
-  // Note: invoices use Search API filtered to impl product — much faster than
-  // expanding line items on every paid invoice
-  const [activeSubs, implInvoiceItems, cancelEvents, updateEvents] = await Promise.all([
-    paginatedFetch('https://api.stripe.com/v1/subscriptions?status=active&limit=100', MAX_PAGES, 'subs'),
-    paginatedFetch('https://api.stripe.com/v1/invoiceitems?created[gte]=' + yearStartUnix + '&limit=100', 3, 'impl'),
-    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 2, 'cancel_ev'),
-    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 1, 'upd_ev')
-  ]);
-
-  // ---- Process active subscriptions ----
+  // 1. Active subscriptions — page by page
   let currentMRR = 0, totalActiveSubs = 0, annualSubs = 0, monthlySubs = 0;
   let annualRevenue = 0, monthlyRevenue = 0;
   let newRevenueThisMonth = 0, newRevenuePriorMonth = 0, newMRRThisMonth = 0;
-  const activeCustomerYTD = new Map();
+  let hasMore = true, startingAfter = '', pages = 0;
 
-  for (const sub of activeSubs) {
-    const mrr = calcMRR(sub);
-    currentMRR += mrr;
-    totalActiveSubs += 1;
+  while (hasMore && pages < MAX_PAGES) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/subscriptions?status=active&limit=100' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('subs_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
 
-    const subCreated = new Date(sub.created * 1000);
-    if (subCreated >= currentMonthStart) {
-      newRevenueThisMonth += calcBillingAmount(sub);
-      newMRRThisMonth += mrr;
-    } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
-      newRevenuePriorMonth += calcBillingAmount(sub);
-    }
+    if (data.error) throw new Error('Stripe API error: ' + data.error.message);
 
-    if (subCreated >= yearStart) {
-      const wi = findWeekIndex(weeks, subCreated);
-      if (wi !== -1) {
-        weeklyData[wi].newSubs += 1;
-        weeklyData[wi].newMRR += mrr;
+    for (const sub of data.data) {
+      const mrr = calcMRR(sub);
+      currentMRR += mrr;
+      totalActiveSubs += 1;
+
+      const subCreated = new Date(sub.created * 1000);
+      if (subCreated >= currentMonthStart) {
+        newRevenueThisMonth += calcBillingAmount(sub);
+        newMRRThisMonth += mrr;
+      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+        newRevenuePriorMonth += calcBillingAmount(sub);
       }
-      activeCustomerYTD.set(sub.customer, { mrr, created: subCreated, wi });
-    }
 
-    let isAnnual = false;
-    if (sub.items && sub.items.data) {
-      for (const item of sub.items.data) {
-        const price = item.price || item.plan;
-        if (!price) continue;
-        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-        if (interval === 'year') { isAnnual = true; break; }
+      if (subCreated >= yearStart) {
+        const wi = findWeekIndex(weeks, subCreated);
+        if (wi !== -1) {
+          weeklyData[wi].newSubs += 1;
+          weeklyData[wi].newMRR += mrr;
+        }
       }
+
+      let isAnnual = false;
+      if (sub.items && sub.items.data) {
+        for (const item of sub.items.data) {
+          const price = item.price || item.plan;
+          if (!price) continue;
+          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+          if (interval === 'year') { isAnnual = true; break; }
+        }
+      }
+      if (isAnnual) { annualSubs += 1; annualRevenue += mrr * 12; }
+      else { monthlySubs += 1; monthlyRevenue += mrr; }
     }
-    if (isAnnual) { annualSubs += 1; annualRevenue += mrr * 12; }
-    else { monthlySubs += 1; monthlyRevenue += mrr; }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
   }
 
-  // ---- Process invoice items for impl fees ----
-  // Using /v1/invoiceitems (lightweight, no expansion needed) filtered by product
+  // 2. Implementation fee invoices (with line expansion, max 3 pages)
+  hasMore = true;
+  startingAfter = '';
+  pages = 0;
   let totalImplFeeRevenue = 0, totalImplFeeCount = 0;
-  for (const item of implInvoiceItems) {
-    // Filter to impl fee product
-    const productId = (item.price && item.price.product) || '';
-    if (productId !== IMPL_PRODUCT) continue;
 
-    const createdAt = new Date(item.date * 1000);
-    const wi = findWeekIndex(weeks, createdAt);
-    const amount = (item.amount || 0) / 100;
-    totalImplFeeCount += 1;
-    totalImplFeeRevenue += amount;
-    if (wi !== -1) {
-      weeklyData[wi].implFeeCount += 1;
-      weeklyData[wi].implFeeRevenue += amount;
-    }
-  }
+  while (hasMore && pages < 3) {
+    const pt = Date.now();
+    const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
+      '&limit=50&expand[]=data.lines' +
+      (startingAfter ? '&starting_after=' + startingAfter : '');
+    const resp = await fetch(url, { headers });
+    const data = await resp.json();
+    timings.push('inv_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
 
-  // ---- Process cancellation events ----
-  let cancelVoluntary = 0, cancelFailedPayment = 0, cancelOther = 0, cancelMRRLost = 0;
-  const canceledCustomers = new Set();
+    if (data.error) throw new Error('Stripe invoices error: ' + data.error.message);
 
-  for (const event of cancelEvents) {
-    const sub = event.data && event.data.object;
-    if (!sub) continue;
-
-    canceledCustomers.add(sub.customer);
-
-    const canceledAt = sub.canceled_at || event.created;
-    const cancelDate = new Date(canceledAt * 1000);
-    const cwi = findWeekIndex(weeks, cancelDate);
-    if (cwi !== -1) weeklyData[cwi].cancellations += 1;
-
-    const subCreated = new Date(sub.created * 1000);
-    if (subCreated >= yearStart) {
-      const swi = findWeekIndex(weeks, subCreated);
-      if (swi !== -1) weeklyData[swi].newSubs += 1;
-    }
-
-    if (canceledAt >= currentMonthUnix) {
-      cancelMRRLost += calcMRR(sub);
-      const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
-      if (reason === 'payment_failed' || reason === 'payment_disputed') {
-        cancelFailedPayment += 1;
-      } else if (reason === 'cancellation_requested') {
-        cancelVoluntary += 1;
-      } else {
-        const cancelFeedback = (sub.cancellation_details && sub.cancellation_details.feedback) || '';
-        if (sub.status === 'canceled' && reason === '' && cancelFeedback === '') {
-          cancelFailedPayment += 1;
-        } else {
-          cancelOther += 1;
+    for (const inv of data.data) {
+      const createdAt = new Date(inv.created * 1000);
+      const wi = findWeekIndex(weeks, createdAt);
+      if (inv.lines && inv.lines.data) {
+        for (const line of inv.lines.data) {
+          const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
+          if (productId === IMPL_PRODUCT) {
+            const amount = (line.amount || 0) / 100;
+            totalImplFeeCount += 1;
+            totalImplFeeRevenue += amount;
+            if (wi !== -1) {
+              weeklyData[wi].implFeeCount += 1;
+              weeklyData[wi].implFeeRevenue += amount;
+            }
+          }
         }
       }
     }
-  }
-
-  // ---- Process upgrade/downgrade events ----
-  let totalUpgrades = 0, totalDowngrades = 0, upgradeMRR = 0, downgradeMRR = 0;
-
-  for (const event of updateEvents) {
-    const sub = event.data && event.data.object;
-    const prev = event.data && event.data.previous_attributes;
-    if (!sub || !prev) continue;
-
-    let prevMRR = 0, currMRR = 0;
-
-    if (sub.items && sub.items.data) {
-      for (const item of sub.items.data) {
-        const price = item.price || item.plan;
-        if (!price) continue;
-        const amount = (price.unit_amount || 0) / 100;
-        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-        const qty = item.quantity || 1;
-        currMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
-      }
-    }
-
-    if (prev.items && prev.items.data) {
-      for (const item of prev.items.data) {
-        const price = item.price || item.plan;
-        if (!price) continue;
-        const amount = (price.unit_amount || 0) / 100;
-        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-        const qty = item.quantity || 1;
-        prevMRR += interval === 'year' ? (amount * qty) / 12 : amount * qty;
-      }
-    } else if (prev.plan) {
-      const amount = (prev.plan.amount || 0) / 100;
-      const interval = prev.plan.interval || 'month';
-      prevMRR = interval === 'year' ? amount / 12 : amount;
-    } else {
-      continue;
-    }
-
-    const diff = currMRR - prevMRR;
-    if (Math.abs(diff) < 1) continue;
-
-    const eventDate = new Date(event.created * 1000);
-    const wi = findWeekIndex(weeks, eventDate);
-
-    if (diff > 0) {
-      totalUpgrades += 1; upgradeMRR += diff;
-      if (wi !== -1) { weeklyData[wi].upgrades += 1; weeklyData[wi].upgrade += diff; }
-    } else {
-      totalDowngrades += 1; downgradeMRR += Math.abs(diff);
-      if (wi !== -1) { weeklyData[wi].downgrades += 1; weeklyData[wi].downgrade += Math.abs(diff); }
-    }
-  }
-
-  // ---- Reactivations — cross-reference in memory, no API calls ----
-  let totalReactivations = 0, reactivationMRR = 0;
-
-  for (const [custId, info] of activeCustomerYTD) {
-    if (canceledCustomers.has(custId)) {
-      totalReactivations += 1;
-      reactivationMRR += info.mrr;
-      if (info.wi !== -1) {
-        weeklyData[info.wi].reactivations += 1;
-        weeklyData[info.wi].reactivation += info.mrr;
-      }
-    }
+    hasMore = data.has_more;
+    if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
+    pages++;
   }
 
   timings.push('total:' + (Date.now() - t0) + 'ms');
@@ -346,14 +243,6 @@ async function fetchStripe(weeks, yearStart, now) {
     monthlyRevenue: Math.round(monthlyRevenue),
     newRevenueThisMonth: Math.round(newRevenueThisMonth),
     newRevenuePriorMonth: Math.round(newRevenuePriorMonth),
-    cancelTotal: cancelVoluntary + cancelFailedPayment + cancelOther,
-    cancelVoluntary, cancelFailedPayment, cancelOther,
-    cancelMRRLost: Math.round(cancelMRRLost),
-    totalUpgrades, totalDowngrades,
-    upgradeMRR: Math.round(upgradeMRR),
-    downgradeMRR: Math.round(downgradeMRR),
-    totalReactivations,
-    reactivationMRR: Math.round(reactivationMRR),
     implFeeCount: totalImplFeeCount,
     implFeeRevenue: Math.round(totalImplFeeRevenue),
     timings, weeks: weeklyData
