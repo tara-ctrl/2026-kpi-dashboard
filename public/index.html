@@ -285,6 +285,8 @@ async function loadDashboard() {
     const failedPaymentAmount = (data.stripe && data.stripe.failedPaymentAmount) || 0;
     const totalUpgrades = (data.stripe && data.stripe.totalUpgrades) || 0;
     const upgradeMRR = (data.stripe && data.stripe.upgradeMRR) || 0;
+    const totalDowngrades = (data.stripe && data.stripe.totalDowngrades) || 0;
+    const downgradeMRR = (data.stripe && data.stripe.downgradeMRR) || 0;
     const resubscribeCount = (data.stripe && data.stripe.resubscribeCount) || 0;
     const resubscribeMRR = (data.stripe && data.stripe.resubscribeMRR) || 0;
     const stripeImplFeeCount = (data.stripe && data.stripe.implFeeCount) || 0;
@@ -317,10 +319,11 @@ async function loadDashboard() {
       { label: "New Revenue This Month", value: "$" + newRevenueThisMonth.toLocaleString(), sub: { pct: "From new subscriptions started this month", dir: "neutral" }, source: "Stripe" },
       { label: "MoM Growth", value: (function() { if (priorMonthMRR === 0) return "N/A"; var pct = ((currentMRR - priorMonthMRR) / priorMonthMRR * 100).toFixed(1); return (pct > 0 ? "+" : "") + pct + "%"; })(), sub: { pct: "Prior month MRR: $" + priorMonthMRR.toLocaleString(), dir: priorMonthMRR === 0 ? "neutral" : (currentMRR >= priorMonthMRR ? "up" : "down") }, source: "Stripe" },
       { label: "Impl. Fees (YTD)", value: "$" + stripeImplFeeRevenue.toLocaleString(), sub: { pct: stripeImplFeeCount + " fees collected", dir: "neutral" }, source: "Stripe" },
-      { label: "Cancellations (This Month)", value: cancelTotal, sub: { pct: cancelVoluntary + " voluntary / " + cancelFailedPayment + " auto-canceled · -$" + cancelMRRLost.toLocaleString() + " MRR", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
+      { label: "Churn (This Month)", value: cancelTotal, sub: { pct: "-$" + cancelMRRLost.toLocaleString() + " MRR lost", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Failed Payments (This Month)", value: failedPaymentCount, sub: { pct: "$" + failedPaymentAmount.toLocaleString() + " at risk", dir: failedPaymentCount > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Upgrades (This Month)", value: totalUpgrades, sub: { pct: "+$" + upgradeMRR.toLocaleString() + " MRR", dir: totalUpgrades > 0 ? "up" : "neutral" }, source: "Stripe" },
-      { label: "Resubscribes (This Month)", value: resubscribeCount, sub: { pct: "+$" + resubscribeMRR.toLocaleString() + " MRR from returning customers", dir: resubscribeCount > 0 ? "up" : "neutral" }, source: "Stripe" },
+      { label: "Downgrades (This Month)", value: totalDowngrades, sub: { pct: "-$" + downgradeMRR.toLocaleString() + " MRR", dir: totalDowngrades > 0 ? "down" : "neutral" }, source: "Stripe" },
+      { label: "Reactivations (This Month)", value: resubscribeCount, sub: { pct: "+$" + resubscribeMRR.toLocaleString() + " MRR from returning customers", dir: resubscribeCount > 0 ? "up" : "neutral" }, source: "Stripe" },
       { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
       { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
       { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: wowChange(newEstates), source: "Supabase" },
