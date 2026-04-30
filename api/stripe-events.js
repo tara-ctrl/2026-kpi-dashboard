@@ -47,18 +47,22 @@ module.exports = async (req, res) => {
 
       if (canceledAt >= currentMonthUnix) {
         cancelMRRLost += calcMRR(sub);
+
+        // Detect failed payment vs voluntary cancellation:
+        // 1. Check cancellation_details.reason first (most reliable when set correctly)
+        // 2. Fall back to event.request — if null/no ID, it was automatic (dunning/failed payment)
+        //    If request.id exists, it was manually triggered (voluntary)
         const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
+        const wasAutomatic = !event.request || !event.request.id;
+
         if (reason === 'payment_failed' || reason === 'payment_disputed') {
           cancelFailedPayment += 1;
-        } else if (reason === 'cancellation_requested') {
-          cancelVoluntary += 1;
+        } else if (wasAutomatic) {
+          // No API request triggered this = automatic cancellation (failed payment / dunning)
+          cancelFailedPayment += 1;
         } else {
-          const cancelFeedback = (sub.cancellation_details && sub.cancellation_details.feedback) || '';
-          if (sub.status === 'canceled' && reason === '' && cancelFeedback === '') {
-            cancelFailedPayment += 1;
-          } else {
-            cancelOther += 1;
-          }
+          // Manual cancellation with a request ID = voluntary
+          cancelVoluntary += 1;
         }
       }
     }
