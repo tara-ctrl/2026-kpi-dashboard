@@ -26,7 +26,7 @@ const EXCLUDED_PORTALS = [
   '1f25b2d3-56fc-4835-8eb7-074367c06a25',
   'cd2cfafa-4d53-457f-94bf-19fa164abd34'
 ];
-const MAX_PAGES = 8; // Max pagination pages per endpoint (800 subs capacity)
+const MAX_PAGES = 7; // Max pagination pages per endpoint (700 subs capacity)
 const FETCH_TIMEOUT = 6000; // 6s timeout per individual API call
 const SERVICE_TIMEOUT = 28000; // 28s max per service (function has 30s limit)
 
@@ -146,11 +146,13 @@ async function fetchStripe(weeks, yearStart, now) {
   }
 
   // *** ALL API CALLS RUN IN PARALLEL ***
-  const [activeSubs, invoices, cancelEvents, updateEvents] = await Promise.all([
+  // Note: invoices use Search API filtered to impl product — much faster than
+  // expanding line items on every paid invoice
+  const [activeSubs, implInvoiceItems, cancelEvents, updateEvents] = await Promise.all([
     paginatedFetch('https://api.stripe.com/v1/subscriptions?status=active&limit=100', MAX_PAGES, 'subs'),
-    paginatedFetch('https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix + '&limit=100&expand[]=data.lines', 6, 'inv'),
-    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 3, 'cancel_ev'),
-    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 2, 'upd_ev')
+    paginatedFetch('https://api.stripe.com/v1/invoiceitems?created[gte]=' + yearStartUnix + '&limit=100', 3, 'impl'),
+    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 2, 'cancel_ev'),
+    paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 1, 'upd_ev')
   ]);
 
   // ---- Process active subscriptions ----
@@ -194,24 +196,22 @@ async function fetchStripe(weeks, yearStart, now) {
     else { monthlySubs += 1; monthlyRevenue += mrr; }
   }
 
-  // ---- Process invoices for impl fees ----
+  // ---- Process invoice items for impl fees ----
+  // Using /v1/invoiceitems (lightweight, no expansion needed) filtered by product
   let totalImplFeeRevenue = 0, totalImplFeeCount = 0;
-  for (const inv of invoices) {
-    const createdAt = new Date(inv.created * 1000);
+  for (const item of implInvoiceItems) {
+    // Filter to impl fee product
+    const productId = (item.price && item.price.product) || '';
+    if (productId !== IMPL_PRODUCT) continue;
+
+    const createdAt = new Date(item.date * 1000);
     const wi = findWeekIndex(weeks, createdAt);
-    if (inv.lines && inv.lines.data) {
-      for (const line of inv.lines.data) {
-        const productId = (line.price && line.price.product) || (line.plan && line.plan.product);
-        if (productId === IMPL_PRODUCT) {
-          const amount = (line.amount || 0) / 100;
-          totalImplFeeCount += 1;
-          totalImplFeeRevenue += amount;
-          if (wi !== -1) {
-            weeklyData[wi].implFeeCount += 1;
-            weeklyData[wi].implFeeRevenue += amount;
-          }
-        }
-      }
+    const amount = (item.amount || 0) / 100;
+    totalImplFeeCount += 1;
+    totalImplFeeRevenue += amount;
+    if (wi !== -1) {
+      weeklyData[wi].implFeeCount += 1;
+      weeklyData[wi].implFeeRevenue += amount;
     }
   }
 
