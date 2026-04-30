@@ -213,10 +213,10 @@ async function fetchStripe(weeks, yearStart, now) {
 
   // Use search API for invoices with specific product (faster, no expand needed)
   // Fallback: just fetch invoices without expansion and check line items in first page
-  while (hasMore && pages < 3) {
+  while (hasMore && pages < 8) {
     const pt = Date.now();
     const url = 'https://api.stripe.com/v1/invoices?status=paid&created[gte]=' + yearStartUnix +
-      '&limit=50&expand[]=data.lines' +
+      '&limit=100&expand[]=data.lines' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
     const resp = await fetch(url, { headers });
     const data = await resp.json();
@@ -248,7 +248,10 @@ async function fetchStripe(weeks, yearStart, now) {
     pages++;
   }
 
-  // 3. Cancellations this month — fetch canceled subs, filter by canceled_at
+  // 3. Cancellations — use Events API (customer.subscription.deleted) for accurate
+  //    chronological data. Events are ordered by date, so we get all current-month
+  //    cancellations reliably without the creation-date ordering problem.
+  //    Also fetch a broader set for reactivation customer ID tracking.
   hasMore = true;
   startingAfter = '';
   pages = 0;
@@ -258,55 +261,70 @@ async function fetchStripe(weeks, yearStart, now) {
   let cancelMRRLost = 0;
   const currentMonthUnix = Math.floor(currentMonthStart.getTime() / 1000);
 
-  while (hasMore && pages < 3) {
+  // Fetch cancellation events for YTD (for weekly chart + reactivation tracking)
+  while (hasMore && pages < 5) {
     const pt = Date.now();
-    const url = 'https://api.stripe.com/v1/subscriptions?status=canceled&limit=100' +
+    const url = 'https://api.stripe.com/v1/events?type=customer.subscription.deleted' +
+      '&created[gte]=' + yearStartUnix + '&limit=100' +
       (startingAfter ? '&starting_after=' + startingAfter : '');
     const resp = await fetch(url, { headers });
     const data = await resp.json();
-    timings.push('cancel_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
+    timings.push('cancel_ev_p' + (pages+1) + ':' + (Date.now() - pt) + 'ms/' + (data.data ? data.data.length : 0) + 'items');
 
-    if (data.error) throw new Error('Stripe cancel error: ' + data.error.message);
+    if (data.error) throw new Error('Stripe cancel events error: ' + data.error.message);
 
-    let foundOlder = false;
-    for (const sub of data.data) {
-      const canceledAt = sub.canceled_at || 0;
-      // Always track customer for reactivation detection, even if older than current month
+    for (const event of data.data) {
+      const sub = event.data && event.data.object;
+      if (!sub) continue;
+
+      // Track customer for reactivation detection
       canceledCustomers.add(sub.customer);
-      if (canceledAt < currentMonthUnix) { foundOlder = true; continue; }
 
-      const lostMRR = calcMRR(sub);
-      cancelMRRLost += lostMRR;
+      const canceledAt = sub.canceled_at || event.created;
+      const cancelDate = new Date((canceledAt) * 1000);
 
-      const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
-      if (reason === 'payment_failed' || reason === 'payment_disputed') {
-        cancelFailedPayment += 1;
-      } else if (reason === 'cancellation_requested') {
-        cancelVoluntary += 1;
-      } else {
-        cancelOther += 1;
-      }
-
-      // Bucket cancellation into weekly chart data
-      const cancelDate = new Date(canceledAt * 1000);
+      // Bucket into weekly chart
       const cwi = findWeekIndex(weeks, cancelDate);
       if (cwi !== -1) weeklyData[cwi].cancellations += 1;
 
-      // Also count this as a new sub in the week it was created (if YTD)
-      const cancelSubCreated = new Date(sub.created * 1000);
-      if (cancelSubCreated >= yearStart) {
-        const swi = findWeekIndex(weeks, cancelSubCreated);
+      // Also count as new sub in the week it was created (if YTD)
+      const subCreated = new Date(sub.created * 1000);
+      if (subCreated >= yearStart) {
+        const swi = findWeekIndex(weeks, subCreated);
         if (swi !== -1) weeklyData[swi].newSubs += 1;
+      }
+
+      // Current month totals for KPI card
+      if (canceledAt >= currentMonthUnix) {
+        const lostMRR = calcMRR(sub);
+        cancelMRRLost += lostMRR;
+
+        // Determine cancellation reason
+        const reason = (sub.cancellation_details && sub.cancellation_details.reason) || '';
+        // Check both the reason field AND whether the last invoice was unpaid
+        // Stripe sets reason to 'payment_failed' for dunning failures,
+        // but also check 'automatic' cancellation with unpaid status
+        if (reason === 'payment_failed' || reason === 'payment_disputed') {
+          cancelFailedPayment += 1;
+        } else if (reason === 'cancellation_requested') {
+          cancelVoluntary += 1;
+        } else {
+          // For subs canceled automatically (not by customer request),
+          // check if it was likely a payment failure
+          const cancelFeedback = (sub.cancellation_details && sub.cancellation_details.feedback) || '';
+          if (sub.status === 'canceled' && reason === '' && cancelFeedback === '') {
+            // No reason and no feedback = likely automatic cancellation from failed payment
+            cancelFailedPayment += 1;
+          } else {
+            cancelOther += 1;
+          }
+        }
       }
     }
 
-    // Stop if we've gone past current month (canceled subs are returned newest first)
-    if (foundOlder && !data.has_more) break;
     hasMore = data.has_more;
     if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
     pages++;
-    // If most results are older than current month, stop early
-    if (foundOlder) break;
   }
 
   // 4. Upgrades & Downgrades — via subscription update events where price changed
