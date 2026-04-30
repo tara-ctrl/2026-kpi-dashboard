@@ -322,7 +322,6 @@ async function loadDashboard() {
       { label: "Churn (This Month)", value: cancelTotal, sub: { pct: "-$" + cancelMRRLost.toLocaleString() + " MRR lost", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Failed Payments (This Month)", value: failedPaymentCount, sub: { pct: "$" + failedPaymentAmount.toLocaleString() + " at risk", dir: failedPaymentCount > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Upgrades (This Month)", value: totalUpgrades, sub: { pct: "+$" + upgradeMRR.toLocaleString() + " MRR", dir: totalUpgrades > 0 ? "up" : "neutral" }, source: "Stripe" },
-      { label: "Downgrades (This Month)", value: totalDowngrades, sub: { pct: "-$" + downgradeMRR.toLocaleString() + " MRR", dir: totalDowngrades > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Reactivations (This Month)", value: resubscribeCount, sub: { pct: "+$" + resubscribeMRR.toLocaleString() + " MRR from returning customers", dir: resubscribeCount > 0 ? "up" : "neutral" }, source: "Stripe" },
       { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
       { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
