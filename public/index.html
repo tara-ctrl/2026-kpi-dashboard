@@ -194,8 +194,10 @@ async function loadDashboard() {
       data.stripe.totalDowngrades = eventsData.totalDowngrades;
       data.stripe.upgradeMRR = eventsData.upgradeMRR;
       data.stripe.downgradeMRR = eventsData.downgradeMRR;
-      data.stripe.totalReactivations = eventsData.totalReactivations || 0;
-      data.stripe.reactivationMRR = eventsData.reactivationMRR || 0;
+      data.stripe.resubscribeCount = eventsData.resubscribeCount || 0;
+      data.stripe.resubscribeMRR = eventsData.resubscribeMRR || 0;
+      data.stripe.failedPaymentCount = eventsData.failedPaymentCount || 0;
+      data.stripe.failedPaymentAmount = eventsData.failedPaymentAmount || 0;
 
       // Merge weekly events data into stripe weeks
       if (eventsData.weeks && data.stripe.weeks) {
@@ -279,6 +281,12 @@ async function loadDashboard() {
     const cancelFailedPayment = (data.stripe && data.stripe.cancelFailedPayment) || 0;
     const cancelOther = (data.stripe && data.stripe.cancelOther) || 0;
     const cancelMRRLost = (data.stripe && data.stripe.cancelMRRLost) || 0;
+    const failedPaymentCount = (data.stripe && data.stripe.failedPaymentCount) || 0;
+    const failedPaymentAmount = (data.stripe && data.stripe.failedPaymentAmount) || 0;
+    const totalUpgrades = (data.stripe && data.stripe.totalUpgrades) || 0;
+    const upgradeMRR = (data.stripe && data.stripe.upgradeMRR) || 0;
+    const resubscribeCount = (data.stripe && data.stripe.resubscribeCount) || 0;
+    const resubscribeMRR = (data.stripe && data.stripe.resubscribeMRR) || 0;
     const stripeImplFeeCount = (data.stripe && data.stripe.implFeeCount) || 0;
     const stripeImplFeeRevenue = (data.stripe && data.stripe.implFeeRevenue) || 0;
 
@@ -309,7 +317,10 @@ async function loadDashboard() {
       { label: "New Revenue This Month", value: "$" + newRevenueThisMonth.toLocaleString(), sub: { pct: "From new subscriptions started this month", dir: "neutral" }, source: "Stripe" },
       { label: "MoM Growth", value: (function() { if (priorMonthMRR === 0) return "N/A"; var pct = ((currentMRR - priorMonthMRR) / priorMonthMRR * 100).toFixed(1); return (pct > 0 ? "+" : "") + pct + "%"; })(), sub: { pct: "Prior month MRR: $" + priorMonthMRR.toLocaleString(), dir: priorMonthMRR === 0 ? "neutral" : (currentMRR >= priorMonthMRR ? "up" : "down") }, source: "Stripe" },
       { label: "Impl. Fees (YTD)", value: "$" + stripeImplFeeRevenue.toLocaleString(), sub: { pct: stripeImplFeeCount + " fees collected", dir: "neutral" }, source: "Stripe" },
-      { label: "Cancellations (This Month)", value: cancelTotal, sub: { pct: cancelVoluntary + " voluntary / " + cancelFailedPayment + " failed payment" + (cancelOther > 0 ? " / " + cancelOther + " other" : "") + " · -$" + cancelMRRLost.toLocaleString() + " MRR", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
+      { label: "Cancellations (This Month)", value: cancelTotal, sub: { pct: cancelVoluntary + " voluntary / " + cancelFailedPayment + " auto-canceled · -$" + cancelMRRLost.toLocaleString() + " MRR", dir: cancelTotal > 0 ? "down" : "neutral" }, source: "Stripe" },
+      { label: "Failed Payments (This Month)", value: failedPaymentCount, sub: { pct: "$" + failedPaymentAmount.toLocaleString() + " at risk", dir: failedPaymentCount > 0 ? "down" : "neutral" }, source: "Stripe" },
+      { label: "Upgrades (This Month)", value: totalUpgrades, sub: { pct: "+$" + upgradeMRR.toLocaleString() + " MRR", dir: totalUpgrades > 0 ? "up" : "neutral" }, source: "Stripe" },
+      { label: "Resubscribes (This Month)", value: resubscribeCount, sub: { pct: "+$" + resubscribeMRR.toLocaleString() + " MRR from returning customers", dir: resubscribeCount > 0 ? "up" : "neutral" }, source: "Stripe" },
       { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
       { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
       { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: wowChange(newEstates), source: "Supabase" },
