@@ -171,17 +171,43 @@ async function loadDashboard() {
   const dateLabel = document.getElementById('dateLabel');
 
   try {
-    // Single API call that fetches Stripe + HubSpot + Supabase
-    const resp = await fetch('/api/stripe');
+    // Fetch core data + events data in parallel (two separate Vercel functions)
+    const [resp, eventsResp] = await Promise.all([
+      fetch('/api/stripe'),
+      fetch('/api/stripe-events').catch(function() { return null; })
+    ]);
     if (!resp.ok) throw new Error('API returned HTTP ' + resp.status);
     const data = await resp.json();
+    const eventsData = (eventsResp && eventsResp.ok) ? await eventsResp.json() : {};
+
+    // Merge events data into stripe data
+    if (data.stripe && eventsData.cancelTotal !== undefined) {
+      data.stripe.cancelTotal = eventsData.cancelTotal;
+      data.stripe.cancelVoluntary = eventsData.cancelVoluntary;
+      data.stripe.cancelFailedPayment = eventsData.cancelFailedPayment;
+      data.stripe.cancelOther = eventsData.cancelOther;
+      data.stripe.cancelMRRLost = eventsData.cancelMRRLost;
+      data.stripe.totalUpgrades = eventsData.totalUpgrades;
+      data.stripe.totalDowngrades = eventsData.totalDowngrades;
+      data.stripe.upgradeMRR = eventsData.upgradeMRR;
+      data.stripe.downgradeMRR = eventsData.downgradeMRR;
+      data.stripe.totalReactivations = eventsData.totalReactivations || 0;
+      data.stripe.reactivationMRR = eventsData.reactivationMRR || 0;
+
+      // Merge weekly events data into stripe weeks
+      if (eventsData.weeks && data.stripe.weeks) {
+        for (var ei = 0; ei < eventsData.weeks.length && ei < data.stripe.weeks.length; ei++) {
+          data.stripe.weeks[ei].cancellations = eventsData.weeks[ei].cancellations || 0;
+          data.stripe.weeks[ei].upgrades = eventsData.weeks[ei].upgrades || 0;
+          data.stripe.weeks[ei].downgrades = eventsData.weeks[ei].downgrades || 0;
+        }
+      }
+    }
 
     // Show any partial errors
     if (data.errors && data.errors.length > 0) {
       errorArea.innerHTML = '<div class="error-banner">&#9888; Some data sources had errors: ' + data.errors.join('; ') + '</div>';
     }
-
-    // Stripe timing diagnostics available in data.stripe.timings (hidden from UI)
 
     const stripeWeeks = (data.stripe && data.stripe.weeks) || [];
     const hubspotWeeks = (data.hubspot && data.hubspot.weeks) || [];
