@@ -32,6 +32,8 @@ for (const fn of functions) {
 const config = {
   version: 3,
   routes: [
+    { src: '/upload.html', dest: '/upload.html' },
+    { src: '/upload', dest: '/upload.html' },
     { handle: 'filesystem' },
     { src: '/api/(.*)', dest: '/api/$1' },
     { src: '/(.*)', dest: '/index.html' }
