@@ -81,10 +81,7 @@
   </div>
 </div>
 
-<!-- Note about Webflow -->
-<div class="note-banner">
-  &#9888; Website visitor data (trustate.com) is not available through the Webflow API. Connect Google Analytics for live visitor tracking.
-</div>
+<!-- Webflow note removed -->
 
 <!-- Error messages -->
 <div id="errorArea"></div>
@@ -174,11 +171,17 @@ async function loadDashboard() {
     // Fetch core data + events data in parallel (two separate Vercel functions)
     const [resp, eventsResp] = await Promise.all([
       fetch('/api/stripe'),
-      fetch('/api/stripe-events').catch(function() { return null; })
+      fetch('/api/stripe-events').catch(function(e) { console.error('Events fetch failed:', e); return null; })
     ]);
     if (!resp.ok) throw new Error('API returned HTTP ' + resp.status);
     const data = await resp.json();
-    const eventsData = (eventsResp && eventsResp.ok) ? await eventsResp.json() : {};
+    var eventsData = {};
+    if (eventsResp && eventsResp.ok) {
+      eventsData = await eventsResp.json();
+    } else if (eventsResp) {
+      var evErr = await eventsResp.text().catch(function() { return 'unknown'; });
+      console.error('Events endpoint error:', eventsResp.status, evErr);
+    }
 
     // Merge events data into stripe data
     if (data.stripe && eventsData.cancelTotal !== undefined) {
