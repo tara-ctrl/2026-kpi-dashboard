@@ -23,9 +23,10 @@ module.exports = async (req, res) => {
   const t0 = Date.now();
 
   try {
-    // Fetch cancellation events and upgrade events in parallel
-    const [cancelEvents, updateEvents] = await Promise.all([
-      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + yearStartUnix + '&limit=100', 5, 'cancel_ev', headers, timings),
+    // Fetch cancellation events, failed payments, and upgrade events in parallel
+    const [cancelEvents, failedPaymentEvents, updateEvents] = await Promise.all([
+      paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.deleted&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'cancel_ev', headers, timings),
+      paginatedFetch('https://api.stripe.com/v1/events?type=invoice.payment_failed&created[gte]=' + currentMonthUnix + '&limit=100', 2, 'fail_ev', headers, timings),
       paginatedFetch('https://api.stripe.com/v1/events?type=customer.subscription.updated&created[gte]=' + yearStartUnix + '&limit=100', 3, 'upd_ev', headers, timings)
     ]);
 
@@ -65,6 +66,21 @@ module.exports = async (req, res) => {
           cancelVoluntary += 1;
         }
       }
+    }
+
+    // Process failed payments (distinct from cancellations)
+    // These are invoice payment attempts that failed (card declined, etc.)
+    let failedPaymentCount = 0;
+    let failedPaymentAmount = 0;
+    const failedCustomers = new Set(); // dedupe by customer
+
+    for (const event of failedPaymentEvents) {
+      const invoice = event.data && event.data.object;
+      if (!invoice) continue;
+
+      // Count unique failed payment events this month
+      failedPaymentCount += 1;
+      failedPaymentAmount += (invoice.amount_due || 0) / 100;
     }
 
     // Process upgrades/downgrades
@@ -128,10 +144,12 @@ module.exports = async (req, res) => {
       cancelTotal: cancelVoluntary + cancelFailedPayment + cancelOther,
       cancelVoluntary, cancelFailedPayment, cancelOther,
       cancelMRRLost: Math.round(cancelMRRLost),
+      failedPaymentCount,
+      failedPaymentAmount: Math.round(failedPaymentAmount),
       totalUpgrades, totalDowngrades,
       upgradeMRR: Math.round(upgradeMRR),
       downgradeMRR: Math.round(downgradeMRR),
-      totalReactivations: 0, // Placeholder — needs active sub data from main endpoint
+      totalReactivations: 0,
       reactivationMRR: 0,
       timings,
       weeks: weeks.map((w, i) => ({
