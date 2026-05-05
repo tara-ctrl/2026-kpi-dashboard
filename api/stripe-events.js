@@ -86,6 +86,37 @@ module.exports = async (req, res) => {
       if (cwi !== -1) weeklyChurnYTD[cwi] += 1;
     }
 
+    // Fetch monthly net MRR changes from all uploaded data (for MoM growth in table)
+    const allEventsUrl = SUPA_URL + '/rest/v1/stripe_mrr_events?select=event_timestamp,mrr_change' +
+      '&event_timestamp=gte.' + yearStart.toISOString() +
+      '&order=event_timestamp.asc&limit=5000';
+    const allEventsResp = await fetch(allEventsUrl, { headers });
+    const allEvents = allEventsResp.ok ? await allEventsResp.json() : [];
+
+    // Group net MRR change by month
+    const mNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const monthlyNetMRR = {};
+    for (const evt of allEvents) {
+      const d = new Date(evt.event_timestamp);
+      const key = mNames[d.getUTCMonth()];
+      if (!monthlyNetMRR[key]) monthlyNetMRR[key] = 0;
+      monthlyNetMRR[key] += evt.mrr_change || 0;
+    }
+
+    // Fetch monthly MRR snapshots for MoM growth calculation
+    const snapshotUrl = SUPA_URL + '/rest/v1/monthly_mrr_snapshots?select=month_end,mrr' +
+      '&order=month_end.asc&limit=24';
+    const snapshotResp = await fetch(snapshotUrl, { headers });
+    const snapshots = snapshotResp.ok ? await snapshotResp.json() : [];
+
+    // Convert to { "Jan": 139588, "Feb": 150908, ... }
+    const mrrSnapshots = {};
+    const mNames2 = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    for (const snap of snapshots) {
+      const d = new Date(snap.month_end);
+      mrrSnapshots[mNames2[d.getUTCMonth()]] = parseFloat(snap.mrr);
+    }
+
     // Fetch failed payments live from Stripe (these change daily, not worth uploading)
     let failedPaymentCount = 0, failedPaymentAmount = 0;
     if (SK) {
@@ -132,6 +163,8 @@ module.exports = async (req, res) => {
       totalDowngrades: downgradeCount,
       resubscribeCount: reactivationCount,
       resubscribeMRR: Math.round(reactivationMRR),
+      monthlyNetMRR: monthlyNetMRR,
+      mrrSnapshots: mrrSnapshots,
       weeks: weeks.map((w, i) => ({
         weekOf: w.label,
         cancellations: weeklyChurnYTD[i],
