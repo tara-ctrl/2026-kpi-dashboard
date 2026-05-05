@@ -189,6 +189,7 @@ async function loadDashboard() {
       data.stripe.failedPaymentCount = eventsData.failedPaymentCount || 0;
       data.stripe.failedPaymentAmount = eventsData.failedPaymentAmount || 0;
       data.stripe.monthlyNetMRR = eventsData.monthlyNetMRR || {};
+      data.stripe.mrrSnapshots = eventsData.mrrSnapshots || {};
 
       // Merge weekly events data into stripe weeks
       if (eventsData.weeks && data.stripe.weeks) {
@@ -273,8 +274,8 @@ async function loadDashboard() {
       monthlyData[monthLabel].implFeeRevenue += implFeeRevenue[i];
     }
 
-    // Convert to ordered arrays (Jan through current month)
-    const monthOrder = monthNames.filter(m => monthlyData[m]);
+    // Convert to ordered arrays (Jan through current month, exclude Dec from prior year)
+    const monthOrder = monthNames.filter(m => monthlyData[m] && m !== 'Dec');
     const monthLabels = monthOrder;
     const monthlyDemos = monthOrder.map(m => monthlyData[m].demos);
     const monthlyInfoSessions = monthOrder.map(m => monthlyData[m].infoSessions);
@@ -446,32 +447,34 @@ async function loadDashboard() {
     const tbody = document.querySelector("#weeklyTable tbody");
     tbody.innerHTML = '';
 
-    // Calculate MoM growth based on end-of-month MRR
-    // Work backwards from current MRR using uploaded net MRR changes per month
-    const monthlyNetMRR = (data.stripe && data.stripe.monthlyNetMRR) || {};
-    const eomMRR = []; // end-of-month MRR for each month in monthOrder
+    // Calculate MoM growth using actual MRR snapshots from Supabase
+    const mrrSnapshots = (data.stripe && data.stripe.mrrSnapshots) || {};
 
-    // Start from current MRR and work backwards
-    var runningMRR = currentMRR;
-    for (let i = monthOrder.length - 1; i >= 0; i--) {
-      eomMRR[i] = runningMRR;
-      // Subtract this month's net change to get prior month's end MRR
-      var netChange = monthlyNetMRR[monthOrder[i]] || 0;
-      runningMRR = runningMRR - netChange;
-    }
+    // For the current month, use live MRR; for past months, use snapshots
+    const eomMRR = monthOrder.map(function(m, i) {
+      if (i === monthOrder.length - 1) return currentMRR; // Current month = live MRR
+      return mrrSnapshots[m] || 0;
+    });
 
+    // MoM Growth = (this month end MRR - prior month end MRR) / prior month end MRR
     const momGrowthPcts = [];
+    // Month before our data (Dec prior year) — not available, so first month is N/A
+    // unless we have a snapshot for the month before the first one
+    const allMonthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
     for (let i = 0; i < monthOrder.length; i++) {
       if (i === 0) {
-        // First month — compare against the MRR before this month (runningMRR after all subtractions)
-        if (runningMRR > 0 && monthlyNetMRR[monthOrder[0]]) {
-          var pct = ((eomMRR[0] - runningMRR) / runningMRR * 100).toFixed(1);
+        // For Jan, we'd need Dec's MRR — check snapshots
+        var priorIdx = allMonthNames.indexOf(monthOrder[0]) - 1;
+        var priorMonth = priorIdx >= 0 ? allMonthNames[priorIdx] : 'Dec';
+        var priorMRRVal = mrrSnapshots[priorMonth] || 0;
+        if (priorMRRVal > 0 && eomMRR[0] > 0) {
+          var pct = ((eomMRR[0] - priorMRRVal) / priorMRRVal * 100).toFixed(1);
           momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
         } else {
           momGrowthPcts.push("N/A");
         }
       } else {
-        if (eomMRR[i-1] > 0 && monthlyNetMRR[monthOrder[i]]) {
+        if (eomMRR[i-1] > 0) {
           var pct = ((eomMRR[i] - eomMRR[i-1]) / eomMRR[i-1] * 100).toFixed(1);
           momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
         } else {
