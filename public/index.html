@@ -188,6 +188,7 @@ async function loadDashboard() {
       data.stripe.resubscribeMRR = eventsData.resubscribeMRR || 0;
       data.stripe.failedPaymentCount = eventsData.failedPaymentCount || 0;
       data.stripe.failedPaymentAmount = eventsData.failedPaymentAmount || 0;
+      data.stripe.monthlyNetMRR = eventsData.monthlyNetMRR || {};
 
       // Merge weekly events data into stripe weeks
       if (eventsData.weeks && data.stripe.weeks) {
@@ -445,14 +446,37 @@ async function loadDashboard() {
     const tbody = document.querySelector("#weeklyTable tbody");
     tbody.innerHTML = '';
 
-    // Calculate MoM growth percentages
+    // Calculate MoM growth based on end-of-month MRR
+    // Work backwards from current MRR using uploaded net MRR changes per month
+    const monthlyNetMRR = (data.stripe && data.stripe.monthlyNetMRR) || {};
+    const eomMRR = []; // end-of-month MRR for each month in monthOrder
+
+    // Start from current MRR and work backwards
+    var runningMRR = currentMRR;
+    for (let i = monthOrder.length - 1; i >= 0; i--) {
+      eomMRR[i] = runningMRR;
+      // Subtract this month's net change to get prior month's end MRR
+      var netChange = monthlyNetMRR[monthOrder[i]] || 0;
+      runningMRR = runningMRR - netChange;
+    }
+
     const momGrowthPcts = [];
-    for (let i = 0; i < monthLabels.length; i++) {
-      if (i === 0 || monthlyNewSubs[i-1] === 0) {
-        momGrowthPcts.push("N/A");
+    for (let i = 0; i < monthOrder.length; i++) {
+      if (i === 0) {
+        // First month — compare against the MRR before this month (runningMRR after all subtractions)
+        if (runningMRR > 0 && monthlyNetMRR[monthOrder[0]]) {
+          var pct = ((eomMRR[0] - runningMRR) / runningMRR * 100).toFixed(1);
+          momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
+        } else {
+          momGrowthPcts.push("N/A");
+        }
       } else {
-        const pct = (((monthlyNewSubs[i] - monthlyNewSubs[i-1]) / monthlyNewSubs[i-1]) * 100).toFixed(0);
-        momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
+        if (eomMRR[i-1] > 0 && monthlyNetMRR[monthOrder[i]]) {
+          var pct = ((eomMRR[i] - eomMRR[i-1]) / eomMRR[i-1] * 100).toFixed(1);
+          momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
+        } else {
+          momGrowthPcts.push("N/A");
+        }
       }
     }
 
