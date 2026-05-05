@@ -97,54 +97,44 @@
 <div class="charts-section">
   <div class="chart-row">
     <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--blue)"></span> Demos &amp; Info Sessions per Week</div>
+      <div class="chart-title"><span class="dot" style="background:var(--blue)"></span> Demos &amp; Info Sessions per Month</div>
       <div class="chart-container"><canvas id="chartDemos"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--green)"></span> New Subscriptions per Week</div>
+      <div class="chart-title"><span class="dot" style="background:var(--green)"></span> New Subscriptions per Month</div>
       <div class="chart-container"><canvas id="chartSubs"></canvas></div>
     </div>
   </div>
   <div class="chart-row">
     <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--purple)"></span> Subscription Changes — Stripe (Upgrades / Downgrades / Cancellations)</div>
+      <div class="chart-title"><span class="dot" style="background:var(--purple)"></span> Subscription Changes per Month (Upgrades / Cancellations / Reactivations)</div>
       <div class="chart-container"><canvas id="chartChurn"></canvas></div>
     </div>
     <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--cyan)"></span> Searches &amp; New Estates per Week</div>
+      <div class="chart-title"><span class="dot" style="background:var(--cyan)"></span> Searches &amp; New Estates per Month</div>
       <div class="chart-container"><canvas id="chartProduct"></canvas></div>
-    </div>
-  </div>
-  <div class="chart-row">
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--accent)"></span> Demo-to-Sale Conversion Rate (Weekly)</div>
-      <div class="chart-container"><canvas id="chartConversion"></canvas></div>
-    </div>
-    <div class="chart-card">
-      <div class="chart-title"><span class="dot" style="background:var(--pink)"></span> Weekly MRR Impact by Event Type (Stripe, includes Impl. Fees)</div>
-      <div class="chart-container"><canvas id="chartPlanBreakdown"></canvas></div>
     </div>
   </div>
 </div>
 
-<!-- Weekly Detail Table -->
+<!-- Monthly Detail Table -->
 <div class="data-table-wrap">
-  <h3>Weekly Breakdown — All Metrics</h3>
+  <h3>Monthly Breakdown — All Metrics</h3>
   <table id="weeklyTable">
     <thead>
       <tr>
-        <th>Week</th>
+        <th>Month</th>
         <th>Demos</th>
         <th>New Subs</th>
         <th>Conversion</th>
         <th>Upgrades</th>
-        <th>Downgrades</th>
         <th>Reactivations</th>
         <th>Cancellations</th>
         <th>Impl. Fees</th>
         <th>Impl. Revenue</th>
         <th>Searches</th>
         <th>New Estates</th>
+        <th>MoM Growth</th>
       </tr>
     </thead>
     <tbody></tbody>
@@ -228,12 +218,11 @@ async function loadDashboard() {
     function hw(i) { return hubspotWeeks[i] || {}; }
     function sbw(i) { return supabaseWeeks[i] || {}; }
 
-    // Build data arrays
+    // Build weekly data arrays first
     const totalDemos = [], infoSessions = [], demosSpecific = [];
     const newSubs = [], cancellations = [], upgrades = [], downgrades = [], reactivations = [];
     const searches = [], newEstates = [];
     const implFeeCount = [], implFeeRevenue = [];
-    const mrrNew = [], mrrChurn = [], mrrUpgrade = [], mrrDowngrade = [], mrrReactivation = [], mrrImplFee = [];
 
     for (let i = 0; i < numWeeks; i++) {
       totalDemos.push(hw(i).totalDemos || 0);
@@ -248,16 +237,56 @@ async function loadDashboard() {
       implFeeCount.push(sw(i).implFeeCount || 0);
       implFeeRevenue.push(sw(i).implFeeRevenue || 0);
 
-      mrrNew.push(sw(i).newMRR || 0);
-      mrrChurn.push(sw(i).churn || 0);
-      mrrUpgrade.push(sw(i).upgrade || 0);
-      mrrDowngrade.push(sw(i).downgrade || 0);
-      mrrReactivation.push(sw(i).reactivation || 0);
-      mrrImplFee.push(sw(i).implFeeRevenue || 0);
-
       searches.push(sbw(i).searches || 0);
       newEstates.push(sbw(i).newEstates || 0);
     }
+
+    // ============================================================
+    // AGGREGATE WEEKLY DATA TO MONTHLY BUCKETS
+    // ============================================================
+    const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const monthlyData = {};
+
+    // Parse week labels to group by month
+    for (let i = 0; i < numWeeks; i++) {
+      const monthLabel = weekLabels[i].split(' ')[0]; // "Jan", "Feb", etc.
+      if (!monthlyData[monthLabel]) {
+        monthlyData[monthLabel] = {
+          demos: 0, infoSessions: 0, demosSpecific: 0,
+          newSubs: 0, searches: 0, newEstates: 0,
+          cancellations: 0, upgrades: 0, downgrades: 0, reactivations: 0,
+          implFeeCount: 0, implFeeRevenue: 0
+        };
+      }
+      monthlyData[monthLabel].demos += totalDemos[i];
+      monthlyData[monthLabel].infoSessions += infoSessions[i];
+      monthlyData[monthLabel].demosSpecific += demosSpecific[i];
+      monthlyData[monthLabel].newSubs += newSubs[i];
+      monthlyData[monthLabel].searches += searches[i];
+      monthlyData[monthLabel].newEstates += newEstates[i];
+      monthlyData[monthLabel].cancellations += cancellations[i];
+      monthlyData[monthLabel].upgrades += upgrades[i];
+      monthlyData[monthLabel].downgrades += downgrades[i];
+      monthlyData[monthLabel].reactivations += reactivations[i];
+      monthlyData[monthLabel].implFeeCount += implFeeCount[i];
+      monthlyData[monthLabel].implFeeRevenue += implFeeRevenue[i];
+    }
+
+    // Convert to ordered arrays (Jan through current month)
+    const monthOrder = monthNames.filter(m => monthlyData[m]);
+    const monthLabels = monthOrder;
+    const monthlyDemos = monthOrder.map(m => monthlyData[m].demos);
+    const monthlyInfoSessions = monthOrder.map(m => monthlyData[m].infoSessions);
+    const monthlyDemosSpecific = monthOrder.map(m => monthlyData[m].demosSpecific);
+    const monthlyNewSubs = monthOrder.map(m => monthlyData[m].newSubs);
+    const monthlySearches = monthOrder.map(m => monthlyData[m].searches);
+    const monthlyNewEstates = monthOrder.map(m => monthlyData[m].newEstates);
+    const monthlyCancellations = monthOrder.map(m => monthlyData[m].cancellations);
+    const monthlyUpgrades = monthOrder.map(m => monthlyData[m].upgrades);
+    const monthlyDowngrades = monthOrder.map(m => monthlyData[m].downgrades);
+    const monthlyReactivations = monthOrder.map(m => monthlyData[m].reactivations);
+    const monthlyImplFeeCount = monthOrder.map(m => monthlyData[m].implFeeCount);
+    const monthlyImplFeeRevenue = monthOrder.map(m => monthlyData[m].implFeeRevenue);
 
     // ============================================================
     // COMPUTED METRICS
@@ -293,18 +322,17 @@ async function loadDashboard() {
     const stripeImplFeeRevenue = (data.stripe && data.stripe.implFeeRevenue) || 0;
 
     // HubSpot & Supabase YTD totals
-    const totalDemosYTD = totalDemos.reduce((a,b) => a+b, 0);
-    const totalSearchesYTD = searches.reduce((a,b) => a+b, 0);
-    const totalEstatesYTD = newEstates.reduce((a,b) => a+b, 0);
-    const totalImplFeeWeekly = implFeeRevenue.reduce((a,b) => a+b, 0);
+    const totalDemosYTD = monthlyDemos.reduce((a,b) => a+b, 0);
+    const totalSearchesYTD = monthlySearches.reduce((a,b) => a+b, 0);
+    const totalEstatesYTD = monthlyNewEstates.reduce((a,b) => a+b, 0);
 
-    const conversionRate = totalDemos.map((d, i) => d > 0 ? Math.round((newSubs[i] / d) * 100) : 0);
+    const monthlyConversionRate = monthlyDemos.map((d, i) => d > 0 ? Math.round((monthlyNewSubs[i] / d) * 100) : 0);
 
-    const lastIdx = numWeeks - 1;
-    const prevIdx = lastIdx - 1;
-    function wowChange(arr) {
-      if (prevIdx < 0 || arr[prevIdx] === 0) return { pct: "N/A", dir: "neutral" };
-      const pct = (((arr[lastIdx] - arr[prevIdx]) / arr[prevIdx]) * 100).toFixed(0);
+    const lastMonthIdx = monthOrder.length - 1;
+    const prevMonthIdx = lastMonthIdx - 1;
+    function momChange(arr) {
+      if (prevMonthIdx < 0 || arr[prevMonthIdx] === 0) return { pct: "N/A", dir: "neutral" };
+      const pct = (((arr[lastMonthIdx] - arr[prevMonthIdx]) / arr[prevMonthIdx]) * 100).toFixed(0);
       return { pct: (pct > 0 ? "+" : "") + pct + "%", dir: pct > 0 ? "up" : pct < 0 ? "down" : "neutral" };
     }
 
@@ -323,16 +351,16 @@ async function loadDashboard() {
       { label: "Failed Payments (This Month)", value: failedPaymentCount, sub: { pct: "$" + failedPaymentAmount.toLocaleString() + " at risk", dir: failedPaymentCount > 0 ? "down" : "neutral" }, source: "Stripe" },
       { label: "Upgrades (This Month)", value: totalUpgrades, sub: { pct: "+$" + upgradeMRR.toLocaleString() + " MRR", dir: totalUpgrades > 0 ? "up" : "neutral" }, source: "Stripe" },
       { label: "Reactivations (This Month)", value: resubscribeCount, sub: { pct: "+$" + resubscribeMRR.toLocaleString() + " MRR from returning customers", dir: resubscribeCount > 0 ? "up" : "neutral" }, source: "Stripe" },
-      { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: wowChange(totalDemos), source: "HubSpot" },
-      { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: wowChange(searches), source: "Supabase" },
-      { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: wowChange(newEstates), source: "Supabase" },
+      { label: "Demos / Info Sessions (YTD)", value: totalDemosYTD, sub: momChange(monthlyDemos), source: "HubSpot" },
+      { label: "Searches Run (YTD)", value: totalSearchesYTD.toLocaleString(), sub: momChange(monthlySearches), source: "Supabase" },
+      { label: "New Estates (YTD)", value: totalEstatesYTD.toLocaleString(), sub: momChange(monthlyNewEstates), source: "Supabase" },
     ];
 
     const kpiGrid = document.getElementById("kpiCards");
     kpiGrid.innerHTML = '';
     kpis.forEach(k => {
       const dir = k.sub.dir;
-      kpiGrid.innerHTML += '<div class="kpi-card"><div class="kpi-label">' + k.label + '</div><div class="kpi-value">' + k.value + '</div><div class="kpi-sub"><span class="' + dir + '">' + k.sub.pct + ' WoW</span> &middot; ' + k.source + '</div></div>';
+      kpiGrid.innerHTML += '<div class="kpi-card"><div class="kpi-label">' + k.label + '</div><div class="kpi-value">' + k.value + '</div><div class="kpi-sub"><span class="' + dir + '">' + k.sub.pct + ' MoM</span> &middot; ' + k.source + '</div></div>';
     });
 
     // ============================================================
@@ -342,10 +370,10 @@ async function loadDashboard() {
     new Chart(document.getElementById("chartDemos"), {
       type: "bar",
       data: {
-        labels: weekLabels,
+        labels: monthLabels,
         datasets: [
-          { label: "Info Sessions", data: infoSessions, backgroundColor: "#3b82f6aa", borderRadius: 4, barPercentage: 0.7 },
-          { label: "1:1 Demos", data: demosSpecific, backgroundColor: "#6366f1aa", borderRadius: 4, barPercentage: 0.7 },
+          { label: "Info Sessions", data: monthlyInfoSessions, backgroundColor: "#3b82f6aa", borderRadius: 4, barPercentage: 0.7 },
+          { label: "1:1 Demos", data: monthlyDemosSpecific, backgroundColor: "#6366f1aa", borderRadius: 4, barPercentage: 0.7 },
         ]
       },
       options: {
@@ -358,11 +386,11 @@ async function loadDashboard() {
     new Chart(document.getElementById("chartSubs"), {
       type: "bar",
       data: {
-        labels: weekLabels,
+        labels: monthLabels,
         datasets: [{
           label: "New Subscriptions",
-          data: newSubs,
-          backgroundColor: newSubs.map((v, i) => i === lastIdx ? "#22c55e" : "#22c55e88"),
+          data: monthlyNewSubs,
+          backgroundColor: monthlyNewSubs.map((v, i) => i === lastMonthIdx ? "#22c55e" : "#22c55e88"),
           borderRadius: 4, barPercentage: 0.6
         }]
       },
@@ -376,12 +404,11 @@ async function loadDashboard() {
     new Chart(document.getElementById("chartChurn"), {
       type: "line",
       data: {
-        labels: weekLabels,
+        labels: monthLabels,
         datasets: [
-          { label: "Cancellations", data: cancellations, borderColor: "#ef4444", backgroundColor: "#ef444422", tension: 0.3, fill: true, pointRadius: 3 },
-          { label: "Upgrades", data: upgrades, borderColor: "#22c55e", backgroundColor: "#22c55e22", tension: 0.3, fill: false, pointRadius: 3 },
-          { label: "Downgrades", data: downgrades, borderColor: "#f59e0b", backgroundColor: "#f59e0b22", tension: 0.3, fill: false, pointRadius: 3 },
-          { label: "Reactivations", data: reactivations, borderColor: "#a855f7", backgroundColor: "#a855f722", tension: 0.3, fill: false, pointRadius: 3 },
+          { label: "Cancellations", data: monthlyCancellations, borderColor: "#ef4444", backgroundColor: "#ef444422", tension: 0.3, fill: true, pointRadius: 3 },
+          { label: "Upgrades", data: monthlyUpgrades, borderColor: "#22c55e", backgroundColor: "#22c55e22", tension: 0.3, fill: false, pointRadius: 3 },
+          { label: "Reactivations", data: monthlyReactivations, borderColor: "#a855f7", backgroundColor: "#a855f722", tension: 0.3, fill: false, pointRadius: 3 },
         ]
       },
       options: {
@@ -394,10 +421,10 @@ async function loadDashboard() {
     new Chart(document.getElementById("chartProduct"), {
       type: "line",
       data: {
-        labels: weekLabels,
+        labels: monthLabels,
         datasets: [
-          { label: "Searches", data: searches, borderColor: "#06b6d4", backgroundColor: "#06b6d422", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y" },
-          { label: "New Estates", data: newEstates, borderColor: "#ec4899", backgroundColor: "#ec489922", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y1" },
+          { label: "Searches", data: monthlySearches, borderColor: "#06b6d4", backgroundColor: "#06b6d422", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y" },
+          { label: "New Estates", data: monthlyNewEstates, borderColor: "#ec4899", backgroundColor: "#ec489922", tension: 0.3, fill: true, pointRadius: 3, yAxisID: "y1" },
         ]
       },
       options: {
@@ -411,61 +438,48 @@ async function loadDashboard() {
       }
     });
 
-    new Chart(document.getElementById("chartConversion"), {
-      type: "line",
-      data: {
-        labels: weekLabels,
-        datasets: [{
-          label: "Demo to Subscription %", data: conversionRate,
-          borderColor: "#6366f1", backgroundColor: "#6366f122",
-          tension: 0.3, fill: true, pointRadius: 4, pointBackgroundColor: "#6366f1"
-        }]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: { legend: { display: false }, tooltip: { callbacks: { label: function(ctx) { return ctx.parsed.y + "%"; } } } },
-        scales: { x: { grid: gridOpts }, y: { beginAtZero: true, max: 200, grid: gridOpts, ticks: { callback: function(v) { return v + "%"; } } } }
-      }
-    });
-
-    new Chart(document.getElementById("chartPlanBreakdown"), {
-      type: "bar",
-      data: {
-        labels: weekLabels,
-        datasets: [
-          { label: "New MRR", data: mrrNew, backgroundColor: "#22c55eaa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Impl. Fees", data: mrrImplFee, backgroundColor: "#f59e0baa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Upgrade", data: mrrUpgrade, backgroundColor: "#3b82f6aa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Reactivation", data: mrrReactivation, backgroundColor: "#a855f7aa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Downgrade", data: mrrDowngrade, backgroundColor: "#9ca3afaa", borderRadius: 3, barPercentage: 0.7 },
-          { label: "Churn", data: mrrChurn, backgroundColor: "#ef4444aa", borderRadius: 3, barPercentage: 0.7 },
-        ]
-      },
-      options: {
-        responsive: true, maintainAspectRatio: false,
-        plugins: {
-          legend: { position: "top", labels: { boxWidth: 10, padding: 8, font: { size: 10 } } },
-          tooltip: { callbacks: { label: function(ctx) { return ctx.dataset.label + ": $" + ctx.parsed.y.toLocaleString(); } } }
-        },
-        scales: {
-          x: { stacked: true, grid: gridOpts },
-          y: { stacked: true, grid: gridOpts, ticks: { callback: function(v) { return "$" + (v/1000).toFixed(1) + "k"; } } }
-        }
-      }
-    });
-
-    // Implementation Fee chart removed
-
     // ============================================================
-    // WEEKLY TABLE
+    // MONTHLY TABLE
     // ============================================================
 
     const tbody = document.querySelector("#weeklyTable tbody");
     tbody.innerHTML = '';
-    for (let i = numWeeks - 1; i >= 0; i--) {
-      const conv = totalDemos[i] > 0 ? ((newSubs[i] / totalDemos[i]) * 100).toFixed(0) + "%" : "\u2014";
-      const convClass = totalDemos[i] > 0 ? (newSubs[i]/totalDemos[i] > 0.5 ? "green" : newSubs[i]/totalDemos[i] > 0.2 ? "amber" : "red") : "blue";
-      tbody.innerHTML += '<tr><td style="font-weight:600">' + weekLabels[i] + '</td><td>' + totalDemos[i] + '</td><td>' + newSubs[i] + '</td><td><span class="pill ' + convClass + '">' + conv + '</span></td><td>' + upgrades[i] + '</td><td>' + downgrades[i] + '</td><td>' + reactivations[i] + '</td><td>' + cancellations[i] + '</td><td>' + implFeeCount[i] + '</td><td>$' + implFeeRevenue[i].toLocaleString() + '</td><td>' + searches[i].toLocaleString() + '</td><td>' + newEstates[i] + '</td></tr>';
+
+    // Calculate MoM growth percentages
+    const momGrowthPcts = [];
+    for (let i = 0; i < monthLabels.length; i++) {
+      if (i === 0 || monthlyNewSubs[i-1] === 0) {
+        momGrowthPcts.push("N/A");
+      } else {
+        const pct = (((monthlyNewSubs[i] - monthlyNewSubs[i-1]) / monthlyNewSubs[i-1]) * 100).toFixed(0);
+        momGrowthPcts.push((pct > 0 ? "+" : "") + pct + "%");
+      }
+    }
+
+    // Render in reverse order (newest first)
+    for (let i = monthLabels.length - 1; i >= 0; i--) {
+      const demos = monthlyDemos[i];
+      const newSubsVal = monthlyNewSubs[i];
+      const conv = demos > 0 ? ((newSubsVal / demos) * 100).toFixed(0) + "%" : "\u2014";
+      const convClass = demos > 0 ? (newSubsVal/demos > 0.5 ? "green" : newSubsVal/demos > 0.2 ? "amber" : "red") : "blue";
+
+      const momGrowth = momGrowthPcts[i];
+      const momGrowthClass = momGrowth === "N/A" ? "blue" : (parseInt(momGrowth) > 0 ? "green" : "red");
+
+      tbody.innerHTML += '<tr>' +
+        '<td style="font-weight:600">' + monthLabels[i] + '</td>' +
+        '<td>' + demos + '</td>' +
+        '<td>' + newSubsVal + '</td>' +
+        '<td><span class="pill ' + convClass + '">' + conv + '</span></td>' +
+        '<td>' + monthlyUpgrades[i] + '</td>' +
+        '<td>' + monthlyReactivations[i] + '</td>' +
+        '<td>' + monthlyCancellations[i] + '</td>' +
+        '<td>' + monthlyImplFeeCount[i] + '</td>' +
+        '<td>$' + monthlyImplFeeRevenue[i].toLocaleString() + '</td>' +
+        '<td>' + monthlySearches[i].toLocaleString() + '</td>' +
+        '<td>' + monthlyNewEstates[i] + '</td>' +
+        '<td><span class="pill ' + momGrowthClass + '">' + momGrowth + '</span></td>' +
+        '</tr>';
     }
 
     // Update status
