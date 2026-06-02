@@ -69,10 +69,35 @@
 
   @media (max-width: 1100px) { .kpi-grid { grid-template-columns: repeat(3, 1fr); } .chart-row { grid-template-columns: 1fr; } }
   @media (max-width: 700px) { .kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+
+  /* Login screen */
+  .login-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: var(--bg); display: flex; align-items: center; justify-content: center; z-index: 1000; }
+  .login-box { background: var(--card); border: 1px solid var(--border); border-radius: 16px; padding: 40px; width: 360px; text-align: center; }
+  .login-box h2 { font-size: 1.3rem; margin-bottom: 6px; }
+  .login-box h2 span { color: var(--accent); }
+  .login-box .login-sub { color: var(--muted); font-size: 0.85rem; margin-bottom: 24px; }
+  .login-box input { width: 100%; padding: 12px 16px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-size: 14px; outline: none; margin-bottom: 16px; }
+  .login-box input:focus { border-color: var(--accent); }
+  .login-box button { width: 100%; padding: 12px; background: var(--accent); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; }
+  .login-box button:hover { background: #5558e6; }
+  .login-box .login-error { color: var(--red); font-size: 13px; margin-top: 12px; display: none; }
+  .dashboard-content { display: none; }
 </style>
 </head>
 <body>
 
+<!-- Login Screen -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h2><span>Trustate</span> KPI Dashboard</h2>
+    <p class="login-sub">Enter password to continue</p>
+    <input type="password" id="loginPassword" placeholder="Password" autofocus>
+    <button id="loginBtn" onclick="doLogin()">Sign In</button>
+    <div class="login-error" id="loginError">Incorrect password. Please try again.</div>
+  </div>
+</div>
+
+<div class="dashboard-content" id="dashboardContent">
 <div class="header">
   <h1><span>Trustate</span> KPI Dashboard</h1>
   <div class="header-right">
@@ -525,7 +550,50 @@ async function loadDashboard() {
   }
 }
 
-loadDashboard();
+// Auth: check session, show login or load dashboard
+function doLogin() {
+  var pw = document.getElementById('loginPassword').value;
+  var errEl = document.getElementById('loginError');
+  errEl.style.display = 'none';
+  document.getElementById('loginBtn').textContent = 'Signing in...';
+
+  fetch('/api/auth', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password: pw })
+  })
+  .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, data: d }; }); })
+  .then(function(result) {
+    if (result.ok) {
+      sessionStorage.setItem('trustate_auth', 'yes');
+      document.getElementById('loginOverlay').style.display = 'none';
+      document.getElementById('dashboardContent').style.display = 'block';
+      loadDashboard();
+    } else {
+      errEl.style.display = 'block';
+      document.getElementById('loginBtn').textContent = 'Sign In';
+    }
+  })
+  .catch(function() {
+    errEl.textContent = 'Connection error. Please try again.';
+    errEl.style.display = 'block';
+    document.getElementById('loginBtn').textContent = 'Sign In';
+  });
+}
+
+// Allow Enter key to submit
+document.getElementById('loginPassword').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') doLogin();
+});
+
+// Check if already authenticated this session
+if (sessionStorage.getItem('trustate_auth') === 'yes') {
+  document.getElementById('loginOverlay').style.display = 'none';
+  document.getElementById('dashboardContent').style.display = 'block';
+  loadDashboard();
+}
 </script>
+</div><!-- end dashboard-content -->
 </body>
 </html>
+
