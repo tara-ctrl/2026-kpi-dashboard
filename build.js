@@ -13,7 +13,8 @@ fs.copyFileSync('public/upload.html', outDir + '/static/upload.html');
 const functions = [
   { src: 'api/stripe.js', name: 'api/stripe' },
   { src: 'api/stripe-events.js', name: 'api/stripe-events' },
-  { src: 'api/upload-metrics.js', name: 'api/upload-metrics' }
+  { src: 'api/upload-metrics.js', name: 'api/upload-metrics' },
+  { src: 'api/auth.js', name: 'api/auth' }
 ];
 
 for (const fn of functions) {
@@ -42,3 +43,4 @@ const config = {
 fs.writeFileSync(outDir + '/config.json', JSON.stringify(config, null, 2));
 
 console.log('Build complete: static files + ' + functions.length + ' serverless functions');
+
