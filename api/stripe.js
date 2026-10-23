@@ -124,11 +124,12 @@ async function fetchStripe(weeks, yearStart, now) {
   const priorMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
   const IMPL_PRODUCT = process.env.STRIPE_IMPL_FEE_PRODUCT_ID || 'prod_O8U4J6dnCkPZ1l';
 
-  // 1. Active subscriptions — page by page
-  let currentMRR = 0, totalActiveSubs = 0, annualSubs = 0, monthlySubs = 0;
-  let annualRevenue = 0, monthlyRevenue = 0;
-  let newRevenueThisMonth = 0, newRevenuePriorMonth = 0, newMRRThisMonth = 0;
+  // 1. Active subscriptions — page by page, then deduplicate by customer
+  let totalRawSubs = 0;
   let hasMore = true, startingAfter = '', pages = 0;
+
+  // Collect all subs first, then deduplicate
+  const allSubs = [];
 
   while (hasMore && pages < MAX_PAGES) {
     const pt = Date.now();
@@ -141,41 +142,117 @@ async function fetchStripe(weeks, yearStart, now) {
     if (data.error) throw new Error('Stripe API error: ' + data.error.message);
 
     for (const sub of data.data) {
-      const mrr = calcMRR(sub);
-      currentMRR += mrr;
-      totalActiveSubs += 1;
-
-      const subCreated = new Date(sub.created * 1000);
-      if (subCreated >= currentMonthStart) {
-        newRevenueThisMonth += calcBillingAmount(sub);
-        newMRRThisMonth += mrr;
-      } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
-        newRevenuePriorMonth += calcBillingAmount(sub);
-      }
-
-      if (subCreated >= yearStart) {
-        const wi = findWeekIndex(weeks, subCreated);
-        if (wi !== -1) {
-          weeklyData[wi].newSubs += 1;
-          weeklyData[wi].newMRR += mrr;
-        }
-      }
-
-      let isAnnual = false;
-      if (sub.items && sub.items.data) {
-        for (const item of sub.items.data) {
-          const price = item.price || item.plan;
-          if (!price) continue;
-          const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
-          if (interval === 'year') { isAnnual = true; break; }
-        }
-      }
-      if (isAnnual) { annualSubs += 1; annualRevenue += mrr * 12; }
-      else { monthlySubs += 1; monthlyRevenue += mrr; }
+      totalRawSubs += 1;
+      allSubs.push(sub);
     }
     hasMore = data.has_more;
     if (data.data.length > 0) startingAfter = data.data[data.data.length - 1].id;
     pages++;
+  }
+
+  // Also fetch past_due subs — these are failed payments that will retry.
+  // They should NOT drop out of MRR/ARR since the revenue is recoverable.
+  let pdMore = true, pdAfter = '', pdPages = 0;
+  while (pdMore && pdPages < 2) {
+    const pt = Date.now();
+    const pdUrl = 'https://api.stripe.com/v1/subscriptions?status=past_due&limit=100' +
+      (pdAfter ? '&starting_after=' + pdAfter : '');
+    const pdResp = await fetch(pdUrl, { headers });
+    const pdData = await pdResp.json();
+    timings.push('past_due_p' + (pdPages+1) + ':' + (Date.now() - pt) + 'ms/' + (pdData.data ? pdData.data.length : 0) + 'items');
+
+    if (pdData.data) {
+      for (const sub of pdData.data) {
+        totalRawSubs += 1;
+        allSubs.push(sub);
+      }
+    }
+    pdMore = pdData.has_more;
+    if (pdData.data && pdData.data.length > 0) pdAfter = pdData.data[pdData.data.length - 1].id;
+    pdPages++;
+  }
+
+  // --- DEDUPLICATION ---
+  // Group by customer ID. For each customer with multiple active subs,
+  // keep only the one with the highest MRR (most recent plan).
+  // Duplicates typically arise from upgrades where old sub wasn't cancelled.
+  const byCustomer = {};
+  for (const sub of allSubs) {
+    const custId = sub.customer;
+    if (!byCustomer[custId]) byCustomer[custId] = [];
+    byCustomer[custId].push(sub);
+  }
+
+  const dedupedSubs = [];
+  let duplicateCount = 0, duplicateMRR = 0;
+  const duplicateDetails = []; // for debugging
+
+  for (const custId of Object.keys(byCustomer)) {
+    const custSubs = byCustomer[custId];
+    if (custSubs.length === 1) {
+      dedupedSubs.push(custSubs[0]);
+    } else {
+      // Multiple subs for same customer — keep the highest MRR one
+      custSubs.sort((a, b) => calcMRR(b) - calcMRR(a));
+      dedupedSubs.push(custSubs[0]); // keep highest
+      for (let i = 1; i < custSubs.length; i++) {
+        const dupMrr = calcMRR(custSubs[i]);
+        duplicateCount += 1;
+        duplicateMRR += dupMrr;
+        duplicateDetails.push({
+          customer: custId,
+          subId: custSubs[i].id,
+          mrr: Math.round(dupMrr),
+          created: new Date(custSubs[i].created * 1000).toISOString().slice(0, 10)
+        });
+      }
+    }
+  }
+
+  // Now process deduplicated subs
+  let currentMRR = 0, totalActiveSubs = 0, annualSubs = 0, monthlySubs = 0;
+  let annualRevenue = 0, monthlyRevenue = 0;
+  let newRevenueThisMonth = 0, newRevenuePriorMonth = 0, newMRRThisMonth = 0;
+  let newSubsMonthly = 0, newSubsAnnual = 0;
+
+  for (const sub of dedupedSubs) {
+    const mrr = calcMRR(sub);
+    currentMRR += mrr;
+    totalActiveSubs += 1;
+
+    const subCreated = new Date(sub.created * 1000);
+    if (subCreated >= currentMonthStart) {
+      newRevenueThisMonth += calcBillingAmount(sub);
+      newMRRThisMonth += mrr;
+    } else if (subCreated >= priorMonthStart && subCreated < currentMonthStart) {
+      newRevenuePriorMonth += calcBillingAmount(sub);
+    }
+
+    if (subCreated >= yearStart) {
+      const wi = findWeekIndex(weeks, subCreated);
+      if (wi !== -1) {
+        weeklyData[wi].newSubs += 1;
+        weeklyData[wi].newMRR += mrr;
+      }
+    }
+
+    let isAnnual = false;
+    if (sub.items && sub.items.data) {
+      for (const item of sub.items.data) {
+        const price = item.price || item.plan;
+        if (!price) continue;
+        const interval = (price.recurring && price.recurring.interval) || price.interval || 'month';
+        if (interval === 'year') { isAnnual = true; break; }
+      }
+    }
+    if (isAnnual) { annualSubs += 1; annualRevenue += mrr * 12; }
+    else { monthlySubs += 1; monthlyRevenue += mrr; }
+
+    // Track new subs this month by billing interval
+    if (subCreated >= currentMonthStart) {
+      if (isAnnual) newSubsAnnual += 1;
+      else newSubsMonthly += 1;
+    }
   }
 
   // 2. Implementation fee invoices (with line expansion, max 3 pages)
@@ -232,13 +309,46 @@ async function fetchStripe(weeks, yearStart, now) {
   const mrrWithImpl = currentMRR + monthImplFees + ADDON_ADJUSTMENT;
   const priorMonthMRR = mrrWithImpl - newMRRThisMonth;
 
+  // Fetch non-Stripe revenue from Supabase (bootcamp, etc.)
+  let nonStripeMonthlyRevenue = 0;
+  const SUPA_URL = process.env.SUPABASE_URL;
+  const SUPA_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (SUPA_URL && SUPA_KEY) {
+    try {
+      const supaHeaders = {
+        'apikey': SUPA_KEY,
+        'Authorization': 'Bearer ' + SUPA_KEY,
+        'Content-Type': 'application/json'
+      };
+      // Get all active non-Stripe revenue entries
+      const nsUrl = SUPA_URL + '/rest/v1/non_stripe_revenue?select=monthly_amount,label' +
+        '&is_active=eq.true&order=label.asc';
+      const nsResp = await fetch(nsUrl, { headers: supaHeaders });
+      if (nsResp.ok) {
+        const nsData = await nsResp.json();
+        for (const entry of nsData) {
+          nonStripeMonthlyRevenue += parseFloat(entry.monthly_amount || 0);
+        }
+      }
+    } catch (e) { /* non-Stripe revenue is additive, don't break if it fails */ }
+  }
+
+  const totalMRR = mrrWithImpl + nonStripeMonthlyRevenue;
+
   return {
-    currentMRR: Math.round(mrrWithImpl),
-    currentARR: Math.round(mrrWithImpl * 12),
+    currentMRR: Math.round(totalMRR),
+    currentARR: Math.round(totalMRR * 12),
+    stripeMRR: Math.round(mrrWithImpl),
+    stripeARR: Math.round(mrrWithImpl * 12),
+    nonStripeMonthlyRevenue: Math.round(nonStripeMonthlyRevenue),
     priorMonthMRR: Math.round(priorMonthMRR),
     subscriptionMRR: Math.round(currentMRR),
     implFeesMRR: Math.round(monthImplFees),
-    totalActiveSubs, annualSubs, monthlySubs,
+    totalActiveSubs, totalRawSubs,
+    uniqueCustomers: Object.keys(byCustomer).length,
+    duplicateCount, duplicateMRR: Math.round(duplicateMRR),
+    duplicateDetails: duplicateDetails.slice(0, 20), // first 20 for debugging
+    annualSubs, monthlySubs, newSubsMonthly, newSubsAnnual,
     annualRevenue: Math.round(annualRevenue),
     monthlyRevenue: Math.round(monthlyRevenue),
     newRevenueThisMonth: Math.round(newRevenueThisMonth),
